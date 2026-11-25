@@ -1,0 +1,46 @@
+name: Feature
+description: Specify an independently reviewable implementation task.
+labels: ["Feature"]
+body:
+  - type: textarea
+    id: objective
+    attributes:
+      label: "Objective and project context"
+      description: "Describe the decision or user outcome and existing behavior to preserve."
+    validations:
+      required: true
+  - type: textarea
+    id: ownership
+    attributes:
+      label: "Owner, assistant, priority and jury criteria"
+      description: "Name the responsible human and recommended model. Apply the corresponding labels."
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: "Implementation, interfaces and file ownership"
+      description: "List required behavior, allowed paths, excluded files and shared signatures."
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: "Dependencies and task branch"
+      description: "Link prerequisite issues or state none. Add the issue-specific branch once numbered."
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: "Acceptance criteria, tests and failure handling"
+      description: "Add specific checkbox criteria, edge cases, offline tests and expected results."
+    validations:
+      required: true
+  - type: textarea
+    id: delivery
+    attributes:
+      label: "Deliverables and Definition of Done"
+      description: "Identify artifacts, relevant documentation and human review evidence."
+    validations:
+      required: true

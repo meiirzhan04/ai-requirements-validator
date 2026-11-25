@@ -1,12 +1,12 @@
-# Phase 2 handoff
+# Team ownership and integration
 
-Start from the same locally validated main commit. Each owner checks out the corresponding branch in a separate clone or worktree. One writer per worktree. Only the lead integrates shared contracts and requirements.txt.
+| Human owner | Files and tests | Delivery checkpoint |
+|---|---|---|
+| Meiirzhan · @meiirzhan04 | src/contracts, src/provider, src/prompts, src/pipeline, dependencies, CI and shared configuration. Own contract/provider and pipeline tests. | Real structured response, auditable coverage, semantic verification and integrated run. |
+| Dulat · @rakhyymzhan | src/ingest, src/evidence, src/readiness, main.py and corresponding parser/grounding/CLI tests. | MD/PDF with addressable rows, safe readiness explanation and a reproducible CLI report. |
+| Parasat · @parasattt | src/report, src/clarification, ui, eval_samples, demo and associated tests. | Fixture-backed renderer, evidence views, stakeholder answer with revalidation, benchmark and demo. |
 
-| Branch / owner | Modules and tests | First integration checkpoint | Definition of Done |
-|---|---|---|---|
-| feat/ai-core · Meirzhan | contracts, provider, prompts, pipeline, dependencies and engineering config. Own contract/provider tests and mocked orchestration. | Run the Gemini probe with a team key, exercise extraction DTOs, then produce a real report model from Dulat's parsed input. | All required blocks and audits accounted for, failures visible, semantic verification for major/critical findings, safe request accounting and actual progress. |
-| feat/ingest-verification · Dulat | ingest, evidence, readiness and main.py. Own parser, grounding, decision table and CLI tests. | Supply one real Markdown and equivalent PDF parse with addressable rows. Implement decide against the executable policy. | One-command CLI, no silent page loss, original quotes reproducible, safe partial/failure decisions and tests for lost pages, negation, numbers and units. |
-| feat/ui-clarification · Parasat | report, clarification, ui, eval_samples and demo. Own rendering/UI, edit workflow and evaluation tests. | Load tests/fixtures/sample_report.json through ValidationReport, display two source passages, render Russian output. | CLI and UI show matching counts, no duplicate calls on rerun, questions lead to preview and revalidation, completed demo clearly labels provenance. |
+CODEOWNERS requests reviews from eligible collaborators. The lead coordinates product reviews until Parasat accepts write access. Each issue defines its allowed files, prerequisites, assistant and exact branch. Concurrent tasks with overlapping files must coordinate before either edits those files.
 
 ## Order and integration
 
@@ -21,6 +21,7 @@ Start from the same locally validated main commit. Each owner checks out the cor
 - P1 covers Streamlit inspection, real progress, clarification with custom answers, editable previews, full revalidation and saved report export.
 - P2 includes TXT, DOCX, OCR, extra providers and optimizations after the working MVP.
 
+
 ## Working locally
 
-Use `git switch feat/ai-core` (or your assigned branch) in your own clone. For concurrent work on one machine, create a distinct worktree such as `git worktree add ../hackathon-ingest feat/ingest-verification`. Each worktree has its own ignored .env and virtual environment. Run `python -m pytest -q` before merging. Publishing and sharing the repository is the lead's separate step.
+The three local developer branches point to the foundation commit 1032e25 and have zero unique commits at the collaboration handoff. They are eligible for retirement after each developer confirms there is no separate work. They remain local. Use the [one-issue workflow](../CONTRIBUTING.md) for current development.

@@ -1,0 +1,39 @@
+name: Bug
+description: Report reproducible behavior with sanitized evidence.
+labels: ["Bug"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: "Actual and expected behavior"
+      description: "Describe the affected entry point, run state, revision and expected outcome."
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: "Reproduction and sanitized evidence"
+      description: "Include minimal steps and public or synthetic input. Remove credentials and financial data."
+    validations:
+      required: true
+  - type: textarea
+    id: scope
+    attributes:
+      label: "Ownership, impact and scope"
+      description: "Name the human, assistant, priority, jury criterion, affected contracts and allowed files."
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: "Regression test and acceptance criteria"
+      description: "Give a failing scenario, expected corrected behavior and checks for adjacent cases."
+    validations:
+      required: true
+  - type: textarea
+    id: delivery
+    attributes:
+      label: "Dependencies and delivery"
+      description: "Link prerequisites, task branch and documentation. A reviewed PR must include regression evidence."
+    validations:
+      required: true

@@ -1,0 +1,15 @@
+# The lead integrates shared configuration and contracts.
+* @meiirzhan04
+/src/ingest/ @rakhyymzhan
+/src/evidence/ @rakhyymzhan
+/src/readiness/ @rakhyymzhan
+/main.py @rakhyymzhan
+/tests/unit/test_ingest* @rakhyymzhan
+/tests/unit/test_coverage* @rakhyymzhan
+/tests/unit/test_grounding* @rakhyymzhan
+/tests/unit/test_decide* @rakhyymzhan
+/tests/unit/test_readiness.py @rakhyymzhan
+/tests/integration/test_cli* @rakhyymzhan
+/tests/fixtures/ingest/ @rakhyymzhan
+# Parasat owns report, clarification, UI, eval and demo. While the write
+# invitation is pending the lead routes reviews. Add @parasattt on acceptance.

@@ -1,0 +1,443 @@
+{
+  "schema_version": "1",
+  "metadata": {
+    "run_id": "synthetic-excursion",
+    "document_version": "d7f7bd0de3afd70a906b81819959b3a2834b33e75c59227da79c0185d77f03e4",
+    "started_at": "2026-11-25T09:00:00Z",
+    "model": "synthetic-fixture",
+    "agent_revision": "fixture-v1",
+    "prompt_version": "fixture-v1",
+    "origin": "synthetic",
+    "duration_seconds": 0,
+    "request_attempts": 0
+  },
+  "document": {
+    "version": {
+      "sha256": "d7f7bd0de3afd70a906b81819959b3a2834b33e75c59227da79c0185d77f03e4",
+      "parser_version": "fixture-v1",
+      "name": "Синтетический пример — отмена экскурсии.md",
+      "format": "markdown",
+      "line_count": 4,
+      "blocks": [
+        {
+          "block_id": "B001",
+          "text": "При отмене заявки на экскурсию посетитель получает письмо с подтверждением отмены.",
+          "location": {
+            "section": "Правило рассылки",
+            "line_start": 2,
+            "line_end": 2
+          }
+        },
+        {
+          "block_id": "B002",
+          "text": "При отмене заявки на экскурсию посетитель не получает письмо с подтверждением отмены.",
+          "location": {
+            "section": "Приёмка рассылки",
+            "line_start": 4,
+            "line_end": 4
+          }
+        }
+      ]
+    },
+    "unread_pages": [],
+    "diagnostics": []
+  },
+  "requirements": [
+    {
+      "req_id": "R001",
+      "original_id": null,
+      "category": "functional",
+      "summary": "При отмене заявки на экскурсию посетитель получает письмо с подтверждением отмены.",
+      "source": {
+        "version": "d7f7bd0de3afd70a906b81819959b3a2834b33e75c59227da79c0185d77f03e4",
+        "block_id": "B001",
+        "start": 0,
+        "end": 82,
+        "quote": "При отмене заявки на экскурсию посетитель получает письмо с подтверждением отмены.",
+        "grounding": "exact"
+      }
+    },
+    {
+      "req_id": "R002",
+      "original_id": null,
+      "category": "acceptance",
+      "summary": "При отмене заявки на экскурсию посетитель не получает письмо с подтверждением отмены.",
+      "source": {
+        "version": "d7f7bd0de3afd70a906b81819959b3a2834b33e75c59227da79c0185d77f03e4",
+        "block_id": "B002",
+        "start": 0,
+        "end": 85,
+        "quote": "При отмене заявки на экскурсию посетитель не получает письмо с подтверждением отмены.",
+        "grounding": "exact"
+      }
+    }
+  ],
+  "evaluations": [
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.necessary",
+      "status": "unknown",
+      "rationale": "Нет отдельного обоснования бизнес-потребности.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.appropriate",
+      "status": "pass",
+      "rationale": "Указано наблюдаемое действие системы.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.unambiguous",
+      "status": "pass",
+      "rationale": "Триггер и адресат определены.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.complete",
+      "status": "pass",
+      "rationale": "Указаны событие, получатель и ожидаемое поведение.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.singular",
+      "status": "pass",
+      "rationale": "Описан один результат отмены.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.feasible",
+      "status": "unknown",
+      "rationale": "Сведения о почтовом сервисе и ресурсах не предоставлены.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.verifiable",
+      "status": "pass",
+      "rationale": "При отмене можно проверить наличие письма.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.correct",
+      "status": "unknown",
+      "rationale": "Политика владельца процесса не приложена.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.conforming",
+      "status": "unknown",
+      "rationale": "Шаблон требований не задан.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.necessary",
+      "status": "unknown",
+      "rationale": "Нет отдельного обоснования бизнес-потребности.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.appropriate",
+      "status": "pass",
+      "rationale": "Указано наблюдаемое действие системы.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.unambiguous",
+      "status": "pass",
+      "rationale": "Триггер и адресат определены.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.complete",
+      "status": "pass",
+      "rationale": "Указаны событие, получатель и ожидаемое поведение.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.singular",
+      "status": "pass",
+      "rationale": "Описан один результат отмены.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.feasible",
+      "status": "unknown",
+      "rationale": "Сведения о почтовом сервисе и ресурсах не предоставлены.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.verifiable",
+      "status": "pass",
+      "rationale": "При отмене можно проверить наличие письма.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.correct",
+      "status": "unknown",
+      "rationale": "Политика владельца процесса не приложена.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.conforming",
+      "status": "unknown",
+      "rationale": "Шаблон требований не задан.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "29148.5.2.6.complete",
+      "status": "unknown",
+      "rationale": "В учебном примере для этого свойства нет отдельного обоснования.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "29148.5.2.6.consistent",
+      "status": "fail",
+      "rationale": "Два раздела задают взаимоисключающие результаты отмены.",
+      "finding_ids": [
+        "F001"
+      ]
+    },
+    {
+      "requirement_id": null,
+      "criterion": "29148.5.2.6.feasible",
+      "status": "unknown",
+      "rationale": "В учебном примере для этого свойства нет отдельного обоснования.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "29148.5.2.6.comprehensible",
+      "status": "unknown",
+      "rationale": "В учебном примере для этого свойства нет отдельного обоснования.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "29148.5.2.6.validatable",
+      "status": "unknown",
+      "rationale": "В учебном примере для этого свойства нет отдельного обоснования.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.correct",
+      "status": "unknown",
+      "rationale": "В учебном примере для этого свойства нет отдельного обоснования.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.unambiguous",
+      "status": "unknown",
+      "rationale": "В учебном примере для этого свойства нет отдельного обоснования.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.complete",
+      "status": "unknown",
+      "rationale": "В учебном примере для этого свойства нет отдельного обоснования.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.consistent",
+      "status": "fail",
+      "rationale": "Два раздела задают взаимоисключающие результаты отмены.",
+      "finding_ids": [
+        "F001"
+      ]
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.ranked",
+      "status": "unknown",
+      "rationale": "В учебном примере для этого свойства нет отдельного обоснования.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.verifiable",
+      "status": "unknown",
+      "rationale": "В учебном примере для этого свойства нет отдельного обоснования.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.modifiable",
+      "status": "unknown",
+      "rationale": "В учебном примере для этого свойства нет отдельного обоснования.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.traceable",
+      "status": "unknown",
+      "rationale": "В учебном примере для этого свойства нет отдельного обоснования.",
+      "finding_ids": []
+    }
+  ],
+  "findings": [
+    {
+      "finding_id": "F001",
+      "kind": "contradiction",
+      "severity": "critical",
+      "claim": "Для одной отмены заявки требуется отправить письмо и одновременно исключить его отправку.",
+      "recommendation": "Согласовать правило уведомления и обновить соответствующий пример приёмки.",
+      "requirement_ids": [
+        "R001",
+        "R002"
+      ],
+      "criteria": [
+        "29148.5.2.6.consistent",
+        "830.4.3.consistent"
+      ],
+      "evidence": [
+        {
+          "version": "d7f7bd0de3afd70a906b81819959b3a2834b33e75c59227da79c0185d77f03e4",
+          "block_id": "B001",
+          "start": 0,
+          "end": 82,
+          "quote": "При отмене заявки на экскурсию посетитель получает письмо с подтверждением отмены.",
+          "grounding": "exact"
+        },
+        {
+          "version": "d7f7bd0de3afd70a906b81819959b3a2834b33e75c59227da79c0185d77f03e4",
+          "block_id": "B002",
+          "start": 0,
+          "end": 85,
+          "quote": "При отмене заявки на экскурсию посетитель не получает письмо с подтверждением отмены.",
+          "grounding": "exact"
+        }
+      ],
+      "semantic_status": "supported",
+      "verification_reason": "Оба фрагмента описывают отмену той же заявки и того же получателя. Исключений в образце нет."
+    }
+  ],
+  "coverage": {
+    "execution": "complete",
+    "extraction_blocks": {
+      "planned": [
+        "B001",
+        "B002"
+      ],
+      "completed": [
+        "B001",
+        "B002"
+      ]
+    },
+    "individual_requirements": {
+      "planned": [
+        "R001",
+        "R002"
+      ],
+      "completed": [
+        "R001",
+        "R002"
+      ]
+    },
+    "audit_batches": {
+      "planned": [
+        "batch-1"
+      ],
+      "completed": [
+        "batch-1"
+      ]
+    },
+    "cross_section_groups": {
+      "planned": [
+        "cancellation"
+      ],
+      "completed": [
+        "cancellation"
+      ]
+    },
+    "incomplete_reasons": [],
+    "uncertainties": []
+  },
+  "questions": [
+    {
+      "question_id": "Q001",
+      "finding_ids": [
+        "F001"
+      ],
+      "requirement_ids": [
+        "R001",
+        "R002"
+      ],
+      "evidence": [
+        {
+          "version": "d7f7bd0de3afd70a906b81819959b3a2834b33e75c59227da79c0185d77f03e4",
+          "block_id": "B001",
+          "start": 0,
+          "end": 82,
+          "quote": "При отмене заявки на экскурсию посетитель получает письмо с подтверждением отмены.",
+          "grounding": "exact"
+        },
+        {
+          "version": "d7f7bd0de3afd70a906b81819959b3a2834b33e75c59227da79c0185d77f03e4",
+          "block_id": "B002",
+          "start": 0,
+          "end": 85,
+          "quote": "При отмене заявки на экскурсию посетитель не получает письмо с подтверждением отмены.",
+          "grounding": "exact"
+        }
+      ],
+      "uncertainty": "Не определено ожидаемое уведомление после отмены.",
+      "stakeholder": "product_owner",
+      "priority": "P0",
+      "business_impact": "Команда не может принять реализацию отмены по единому критерию.",
+      "question": "Должен ли посетитель получить письмо при отмене экскурсии?",
+      "options": [
+        {
+          "option_id": "A",
+          "label": "Отправлять",
+          "consequence": "Сохранить функциональное правило и изменить критерий приёмки."
+        },
+        {
+          "option_id": "B",
+          "label": "Не отправлять",
+          "consequence": "Изменить функциональное правило и сохранить критерий приёмки."
+        }
+      ],
+      "allow_custom": true
+    }
+  ],
+  "answers": [],
+  "proposed_changes": [],
+  "verdict": {
+    "readiness": "no_go",
+    "rationale": "До решения по рассылке невозможно однозначно принять отмену заявки.",
+    "next_actions": [
+      "Владелец продукта выбирает политику уведомлений.",
+      "Согласовать оба раздела и повторить аудит новой редакции."
+    ]
+  },
+  "statistics": {
+    "requirements": 2,
+    "violations": 1,
+    "critical": 1,
+    "major": 0,
+    "minor": 0,
+    "open_hypotheses": 0,
+    "questions": 1
+  }
+}

@@ -1,0 +1,1 @@
+"""Shared requirements validation core."""

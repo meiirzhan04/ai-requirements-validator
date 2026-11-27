@@ -130,6 +130,7 @@ class HolisticGroupPayload(BaseModel):
     criteria_catalog: list[str]
     inspected_block_ids: list[str]
     has_uninspected_scope: bool = False
+    structural_signals: list[str] = Field(default_factory=list)
     requirements: list[HolisticRequirementInput]
     passages: list[HolisticPassageInput]
     repair_hint: str | None = None

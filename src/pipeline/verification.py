@@ -1,5 +1,6 @@
 """Independent semantic verification pass for major and critical finding candidates."""
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 import inspect
 
 from pydantic import Field
@@ -153,6 +154,99 @@ def _call_provider(
     )
 
 
+def _execute_verification_batch(
+    *,
+    batch_id: str,
+    batch: list[Finding],
+    document: ParsedDocument,
+    block_map: dict[str, object],
+    block_order: dict[str, int],
+    effective_inspected: set[str],
+    include_full_doc_context: bool,
+    has_uninspected_scope: bool,
+    settings: ProviderSettings,
+    budget: QuotaBudget | None,
+    generate_fn: GenerateFn,
+) -> tuple[StageResult[VerificationOutput] | None, ProviderError | None, int]:
+    context_block_ids: set[str] = set()
+    cited_sections: set[str] = set()
+    for f in batch:
+        for ref in f.evidence:
+            context_block_ids.add(ref.block_id)
+            if ref.block_id in block_map:
+                cited_sections.add(block_map[ref.block_id].location.section)
+        if f.gap:
+            context_block_ids.add(f.gap.context.block_id)
+            context_block_ids.update(f.gap.inspected_blocks)
+    for blk in document.version.blocks:
+        if (
+            include_full_doc_context and blk.block_id in effective_inspected
+        ) or blk.location.section in cited_sections or len(document.version.blocks) <= 20:
+            context_block_ids.add(blk.block_id)
+
+    passages = [
+        HolisticPassageInput(
+            block_id=bid,
+            section=block_map[bid].location.section,
+            text=block_map[bid].text,
+        )
+        for bid in sorted(context_block_ids, key=lambda b: block_order.get(b, 10**9))
+        if bid in block_map
+    ]
+
+    candidates_input = [
+        VerificationCandidateInput(
+            candidate_id=f.finding_id,
+            kind=f.kind,
+            severity=f.severity,
+            claim=f.claim,
+            requirement_ids=list(f.requirement_ids),
+            evidence_quotes=[
+                HolisticEvidenceQuote(block_id=ref.block_id, quote=ref.quote) for ref in f.evidence
+            ],
+            expected_information=f.gap.expected_information if f.gap else None,
+            inspected_blocks=list(f.gap.inspected_blocks) if f.gap else [],
+        )
+        for f in batch
+    ]
+
+    def _make_payload(repair_hint: str | None = None) -> VerificationPayload:
+        return VerificationPayload(
+            system_instruction=VERIFICATION_SYSTEM_PROMPT,
+            prompt_version=VERIFICATION_PROMPT_VERSION,
+            document_name=document.version.name,
+            batch_id=batch_id,
+            has_uninspected_scope=has_uninspected_scope,
+            candidates=candidates_input,
+            context_passages=passages,
+            repair_hint=repair_hint,
+        )
+
+    payload = _make_payload()
+    est_in = _estimate_tokens(payload.model_dump_json(exclude={"system_instruction"}, exclude_none=True))
+    est_out = len(batch) * 140
+    attempts = 0
+    for repair_attempt in range(2):
+        try:
+            stage_result = _call_provider(
+                generate_fn,
+                payload,
+                settings=settings,
+                budget=budget,
+                estimated_input_tokens=est_in,
+                estimated_output_tokens=est_out,
+            )
+            attempts += stage_result.attempts
+            return stage_result, None, attempts
+        except ProviderError as exc:
+            attempts += max(exc.attempts, 0)
+            if exc.action == FailureAction.REPAIR and repair_attempt == 0:
+                payload = _make_payload(repair_hint=VERIFICATION_REPAIR_HINT)
+                continue
+            return None, exc, attempts
+    return None, None, attempts
+
+
 def verify_findings(
     findings: list[Finding],
     document: ParsedDocument,
@@ -162,7 +256,8 @@ def verify_findings(
     inspected_blocks: set[str] | list[str] | None = None,
     budget: QuotaBudget | None = None,
     generate_fn: GenerateFn = generate,
-    batch_size: int = 8,
+    batch_size: int = 16,
+    max_concurrency: int = 1,
 ) -> VerificationResult:
     """Verify major/critical finding candidates separately from quote grounding."""
     all_block_ids = [b.block_id for b in document.version.blocks]
@@ -174,6 +269,8 @@ def verify_findings(
         else (set(inspected_blocks) & set(all_block_ids))
     )
     has_uninspected_scope = bool(document.unread_pages) or effective_inspected != set(all_block_ids)
+    total_doc_chars = sum(len(b.text) for b in document.version.blocks)
+    include_full_doc_context = total_doc_chars <= 24_000
 
     targets = [f for f in findings if _needs_semantic_verification(f)]
     if not targets:
@@ -187,118 +284,17 @@ def verify_findings(
     known_in = 0
     known_out = 0
     has_known_usage = False
+    workers = max(1, max_concurrency)
 
     step = max(1, batch_size)
-    queue: list[tuple[str, list[Finding]]] = [
+    pending_wave: list[tuple[str, list[Finding]]] = [
         (f"verify-{batch_num}", targets[offset : offset + step])
         for batch_num, offset in enumerate(range(0, len(targets), step), start=1)
     ]
 
-    q_idx = 0
-    while q_idx < len(queue):
-        batch_id, batch = queue[q_idx]
-        q_idx += 1
+    def _consume_reviews(batch_id: str, batch: list[Finding], output: VerificationOutput) -> None:
         target_ids = {f.finding_id for f in batch}
-
-        # Collect cited blocks + neighboring blocks from same sections to expose exceptions/conditions.
-        context_block_ids: set[str] = set()
-        cited_sections: set[str] = set()
-        for f in batch:
-            for ref in f.evidence:
-                context_block_ids.add(ref.block_id)
-                if ref.block_id in block_map:
-                    cited_sections.add(block_map[ref.block_id].location.section)
-            if f.gap:
-                context_block_ids.add(f.gap.context.block_id)
-                context_block_ids.update(f.gap.inspected_blocks)
-        for blk in document.version.blocks:
-            if blk.location.section in cited_sections or len(document.version.blocks) <= 20:
-                context_block_ids.add(blk.block_id)
-
-        passages = [
-            HolisticPassageInput(
-                block_id=bid,
-                section=block_map[bid].location.section,
-                text=block_map[bid].text,
-            )
-            for bid in sorted(context_block_ids, key=lambda b: block_order.get(b, 10**9))
-            if bid in block_map
-        ]
-
-        candidates_input = [
-            VerificationCandidateInput(
-                candidate_id=f.finding_id,
-                kind=f.kind,
-                severity=f.severity,
-                claim=f.claim,
-                requirement_ids=list(f.requirement_ids),
-                evidence_quotes=[
-                    HolisticEvidenceQuote(block_id=ref.block_id, quote=ref.quote) for ref in f.evidence
-                ],
-                expected_information=f.gap.expected_information if f.gap else None,
-                inspected_blocks=list(f.gap.inspected_blocks) if f.gap else [],
-            )
-            for f in batch
-        ]
-
-        def _make_payload(repair_hint: str | None = None) -> VerificationPayload:
-            return VerificationPayload(
-                system_instruction=VERIFICATION_SYSTEM_PROMPT,
-                prompt_version=VERIFICATION_PROMPT_VERSION,
-                document_name=document.version.name,
-                batch_id=batch_id,
-                has_uninspected_scope=has_uninspected_scope,
-                candidates=candidates_input,
-                context_passages=passages,
-                repair_hint=repair_hint,
-            )
-
-        payload = _make_payload()
-        est_in = _estimate_tokens(payload.model_dump_json())
-        est_out = len(batch) * 180
-        stage_result: StageResult[VerificationOutput] | None = None
-        stop_all = False
-
-        for repair_attempt in range(2):
-            try:
-                stage_result = _call_provider(
-                    generate_fn,
-                    payload,
-                    settings=settings,
-                    budget=budget,
-                    estimated_input_tokens=est_in,
-                    estimated_output_tokens=est_out,
-                )
-                total_attempts += stage_result.attempts
-                if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
-                    known_in += stage_result.input_tokens
-                    known_out += stage_result.output_tokens
-                    has_known_usage = True
-                break
-            except ProviderError as exc:
-                total_attempts += max(exc.attempts, 0)
-                if exc.action == FailureAction.REPAIR and repair_attempt == 0:
-                    payload = _make_payload(repair_hint=VERIFICATION_REPAIR_HINT)
-                    continue
-                if exc.action == FailureAction.SPLIT and len(batch) > 1:
-                    mid = len(batch) // 2
-                    queue[q_idx:q_idx] = [
-                        (f"{batch_id}.1", batch[:mid]),
-                        (f"{batch_id}.2", batch[mid:]),
-                    ]
-                    stage_result = None
-                    break
-                incomplete_reasons.append(f"Пакет семантической проверки {batch_id} не завершён: {exc}.")
-                if exc.reason in _STOP_ALL_REASONS:
-                    stop_all = True
-                break
-
-        if stop_all:
-            break
-        if stage_result is None:
-            continue
-
-        for review in stage_result.output.reviews:
+        for review in output.reviews:
             if review.candidate_id not in target_ids:
                 uncertainties.append(
                     f"Пакет {batch_id}: семантическая проверка вернула неизвестный candidate_id {review.candidate_id}."
@@ -310,12 +306,101 @@ def verify_findings(
                 )
                 continue
             reviews_by_id[review.candidate_id] = review
-
         for f in batch:
             if f.finding_id not in reviews_by_id:
                 incomplete_reasons.append(
                     f"Семантическая проверка не вернула вердикт для кандидата {f.finding_id}."
                 )
+
+    stop_all = False
+    while pending_wave and not stop_all:
+        if workers <= 1 or len(pending_wave) <= 1:
+            q_idx = 0
+            while q_idx < len(pending_wave):
+                batch_id, batch = pending_wave[q_idx]
+                q_idx += 1
+                stage_result, exc, batch_attempts = _execute_verification_batch(
+                    batch_id=batch_id,
+                    batch=batch,
+                    document=document,
+                    block_map=block_map,
+                    block_order=block_order,
+                    effective_inspected=effective_inspected,
+                    include_full_doc_context=include_full_doc_context,
+                    has_uninspected_scope=has_uninspected_scope,
+                    settings=settings,
+                    budget=budget,
+                    generate_fn=generate_fn,
+                )
+                total_attempts += batch_attempts
+                if exc is not None:
+                    if exc.action == FailureAction.SPLIT and len(batch) > 1:
+                        mid = len(batch) // 2
+                        pending_wave[q_idx:q_idx] = [
+                            (f"{batch_id}.1", batch[:mid]),
+                            (f"{batch_id}.2", batch[mid:]),
+                        ]
+                        continue
+                    incomplete_reasons.append(f"Пакет семантической проверки {batch_id} не завершён: {exc}.")
+                    if exc.reason in _STOP_ALL_REASONS:
+                        stop_all = True
+                        break
+                    continue
+                if stage_result is None:
+                    continue
+                if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
+                    known_in += stage_result.input_tokens
+                    known_out += stage_result.output_tokens
+                    has_known_usage = True
+                _consume_reviews(batch_id, batch, stage_result.output)
+            break
+
+        next_wave: list[tuple[str, list[Finding]]] = []
+        with ThreadPoolExecutor(max_workers=min(workers, len(pending_wave))) as pool:
+            futures = [
+                (
+                    bid,
+                    b,
+                    pool.submit(
+                        _execute_verification_batch,
+                        batch_id=bid,
+                        batch=b,
+                        document=document,
+                        block_map=block_map,
+                        block_order=block_order,
+                        effective_inspected=effective_inspected,
+                        include_full_doc_context=include_full_doc_context,
+                        has_uninspected_scope=has_uninspected_scope,
+                        settings=settings,
+                        budget=budget,
+                        generate_fn=generate_fn,
+                    ),
+                )
+                for bid, b in pending_wave
+            ]
+            wave_results = [(bid, b, *fut.result()) for bid, b, fut in futures]
+
+        for batch_id, batch, stage_result, exc, batch_attempts in wave_results:
+            total_attempts += batch_attempts
+            if exc is not None:
+                if exc.action == FailureAction.SPLIT and len(batch) > 1:
+                    mid = len(batch) // 2
+                    next_wave.extend(
+                        [(f"{batch_id}.1", batch[:mid]), (f"{batch_id}.2", batch[mid:])]
+                    )
+                    continue
+                incomplete_reasons.append(f"Пакет семантической проверки {batch_id} не завершён: {exc}.")
+                if exc.reason in _STOP_ALL_REASONS:
+                    stop_all = True
+                continue
+            if stage_result is None:
+                continue
+            if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
+                known_in += stage_result.input_tokens
+                known_out += stage_result.output_tokens
+                has_known_usage = True
+            _consume_reviews(batch_id, batch, stage_result.output)
+        pending_wave = next_wave
 
     updated_findings: list[Finding] = []
     for f in findings:

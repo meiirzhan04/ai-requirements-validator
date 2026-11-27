@@ -5,6 +5,7 @@ from enum import StrEnum
 import math
 import random
 import re
+import threading
 import time
 from typing import Any
 
@@ -108,27 +109,33 @@ class QuotaBudget:
         self._sleep = sleep
         self._rand = rand
         self._started_at = clock()
+        self._lock = threading.RLock()
 
         self.attempts: int = 0
         self.input_tokens: int = 0
         self.output_tokens: int = 0
         self.known_usage_attempts: int = 0
         self.unknown_usage_attempts: int = 0
+        self.rate_limit_wait_seconds: float = 0.0
+        self.retry_wait_seconds: float = 0.0
         self.attempts_by_stage: Counter[PipelineStage] = Counter()
         self._request_window: deque[float] = deque()
         self._token_window: deque[tuple[float, int]] = deque()
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        with self._lock:
+            return self.input_tokens + self.output_tokens
 
     @property
     def reported_input_tokens(self) -> int | None:
-        return self.input_tokens if self.known_usage_attempts > 0 else None
+        with self._lock:
+            return self.input_tokens if self.known_usage_attempts > 0 else None
 
     @property
     def reported_output_tokens(self) -> int | None:
-        return self.output_tokens if self.known_usage_attempts > 0 else None
+        with self._lock:
+            return self.output_tokens if self.known_usage_attempts > 0 else None
 
     @property
     def elapsed_seconds(self) -> float:
@@ -159,7 +166,14 @@ class QuotaBudget:
         while self._token_window and self._token_window[0][0] <= cutoff:
             self._token_window.popleft()
 
-    def _sleep_within_budget(self, delay: float, *, call_attempts: int, message: str) -> None:
+    def _sleep_within_budget(
+        self,
+        delay: float,
+        *,
+        call_attempts: int,
+        message: str,
+        category: str = "rate",
+    ) -> None:
         if delay <= 0:
             return
         remaining = self.remaining_seconds()
@@ -171,14 +185,13 @@ class QuotaBudget:
                 attempts=call_attempts,
             )
         self._sleep(delay)
+        with self._lock:
+            if category == "retry":
+                self.retry_wait_seconds += delay
+            else:
+                self.rate_limit_wait_seconds += delay
 
-    def reserve_attempt(
-        self,
-        stage: PipelineStage,
-        *,
-        call_attempts: int,
-        estimated_tokens: int = 0,
-    ) -> None:
+    def _check_hard_limits_locked(self, *, call_attempts: int, estimated_tokens: int) -> None:
         if self.rpd_limit is not None and self.attempts >= self.rpd_limit:
             raise ProviderError(
                 "Daily request quota exhausted",
@@ -194,8 +207,9 @@ class QuotaBudget:
                 attempts=call_attempts,
             )
         if self.max_total_tokens is not None:
-            projected = self.total_tokens + max(0, estimated_tokens)
-            if self.total_tokens >= self.max_total_tokens or (
+            total = self.input_tokens + self.output_tokens
+            projected = total + max(0, estimated_tokens)
+            if total >= self.max_total_tokens or (
                 estimated_tokens > 0 and projected > self.max_total_tokens
             ):
                 raise ProviderError(
@@ -213,14 +227,13 @@ class QuotaBudget:
                 attempts=call_attempts,
             )
 
-        self._pace_rate_windows(call_attempts=call_attempts, estimated_tokens=estimated_tokens)
-
-        now = self._clock()
-        self.attempts += 1
-        self.attempts_by_stage[stage] += 1
-        self._request_window.append(now)
-
-    def _pace_rate_windows(self, *, call_attempts: int, estimated_tokens: int) -> None:
+    def reserve_attempt(
+        self,
+        stage: PipelineStage,
+        *,
+        call_attempts: int,
+        estimated_tokens: int = 0,
+    ) -> None:
         needed_tokens = max(0, estimated_tokens)
         if self.tpm_limit is not None and needed_tokens > self.tpm_limit:
             raise ProviderError(
@@ -231,79 +244,97 @@ class QuotaBudget:
             )
 
         while True:
-            now = self._clock()
-            self._prune_windows(now)
-            wait = 0.0
-            if self.rpm_limit is not None and len(self._request_window) >= self.rpm_limit:
-                wait = max(wait, (self._request_window[0] + 60.0) - now)
-            if self.tpm_limit is not None:
-                window_tokens = sum(tokens for _, tokens in self._token_window)
-                over_limit = (
-                    window_tokens >= self.tpm_limit
-                    if needed_tokens == 0
-                    else (window_tokens + needed_tokens) > self.tpm_limit
+            with self._lock:
+                self._check_hard_limits_locked(
+                    call_attempts=call_attempts,
+                    estimated_tokens=estimated_tokens,
                 )
-                if over_limit and self._token_window:
-                    wait = max(wait, (self._token_window[0][0] + 60.0) - now)
-            if wait <= 0:
-                break
+                now = self._clock()
+                self._prune_windows(now)
+                wait = 0.0
+                if self.rpm_limit is not None and len(self._request_window) >= self.rpm_limit:
+                    wait = max(wait, (self._request_window[0] + 60.0) - now)
+                if self.tpm_limit is not None:
+                    window_tokens = sum(tokens for _, tokens in self._token_window)
+                    over_limit = (
+                        window_tokens >= self.tpm_limit
+                        if needed_tokens == 0
+                        else (window_tokens + needed_tokens) > self.tpm_limit
+                    )
+                    if over_limit and self._token_window:
+                        wait = max(wait, (self._token_window[0][0] + 60.0) - now)
+                if wait <= 0:
+                    self.attempts += 1
+                    self.attempts_by_stage[stage] += 1
+                    self._request_window.append(now)
+                    return
+
+            # Sleep outside the lock so concurrent worker threads can proceed or finish cleanly.
             self._sleep_within_budget(
                 wait,
                 call_attempts=call_attempts,
                 message="Rate limit window wait exceeds elapsed budget",
+                category="rate",
             )
 
     def record_usage(self, usage_metadata: Any) -> tuple[int | None, int | None]:
         in_tokens = getattr(usage_metadata, "prompt_token_count", None) if usage_metadata is not None else None
-        out_tokens = getattr(usage_metadata, "candidates_token_count", None) if usage_metadata is not None else None
-        if in_tokens is not None:
-            self.input_tokens += in_tokens
-        if out_tokens is not None:
-            self.output_tokens += out_tokens
-        if in_tokens is None or out_tokens is None:
-            self.unknown_usage_attempts += 1
-        else:
-            self.known_usage_attempts += 1
-        added = (in_tokens or 0) + (out_tokens or 0)
-        if added > 0:
-            now = self._clock()
-            self._prune_windows(now)
-            self._token_window.append((now, added))
+        cand_tokens = getattr(usage_metadata, "candidates_token_count", None) if usage_metadata is not None else None
+        thought_tokens = getattr(usage_metadata, "thoughts_token_count", None) if usage_metadata is not None else None
+        out_tokens = (cand_tokens + (thought_tokens or 0)) if cand_tokens is not None else None
+        with self._lock:
+            if in_tokens is not None:
+                self.input_tokens += in_tokens
+            if out_tokens is not None:
+                self.output_tokens += out_tokens
+            if in_tokens is None or out_tokens is None:
+                self.unknown_usage_attempts += 1
+            else:
+                self.known_usage_attempts += 1
+            added = (in_tokens or 0) + (out_tokens or 0)
+            if added > 0:
+                now = self._clock()
+                self._prune_windows(now)
+                self._token_window.append((now, added))
         return in_tokens, out_tokens
 
     def record_unknown_usage(self) -> None:
-        self.unknown_usage_attempts += 1
+        with self._lock:
+            self.unknown_usage_attempts += 1
 
     def wait_before_retry(self, *, attempt: int, server_delay: float | None = None) -> float:
-        if self.rpd_limit is not None and self.attempts >= self.rpd_limit:
-            raise ProviderError(
-                "Daily request quota exhausted",
-                reason=FailureReason.DAILY_QUOTA_EXHAUSTED,
-                action=FailureAction.STOP,
-                attempts=attempt,
-            )
-        if self.max_total_attempts is not None and self.attempts >= self.max_total_attempts:
-            raise ProviderError(
-                "Request attempt budget exhausted",
-                reason=FailureReason.BUDGET_EXHAUSTED,
-                action=FailureAction.STOP,
-                attempts=attempt,
-            )
-        if self.max_total_tokens is not None and self.total_tokens >= self.max_total_tokens:
-            raise ProviderError(
-                "Token budget exhausted",
-                reason=FailureReason.BUDGET_EXHAUSTED,
-                action=FailureAction.STOP,
-                attempts=attempt,
-            )
-        backoff = min(self.max_delay_seconds, self.base_delay_seconds * (2 ** (attempt - 1)))
-        base = max(backoff, server_delay) if server_delay is not None and server_delay > 0 else backoff
-        sample = min(1.0, max(0.0, float(self._rand())))
-        delay = base + (base * self.jitter_ratio * sample)
+        with self._lock:
+            if self.rpd_limit is not None and self.attempts >= self.rpd_limit:
+                raise ProviderError(
+                    "Daily request quota exhausted",
+                    reason=FailureReason.DAILY_QUOTA_EXHAUSTED,
+                    action=FailureAction.STOP,
+                    attempts=attempt,
+                )
+            if self.max_total_attempts is not None and self.attempts >= self.max_total_attempts:
+                raise ProviderError(
+                    "Request attempt budget exhausted",
+                    reason=FailureReason.BUDGET_EXHAUSTED,
+                    action=FailureAction.STOP,
+                    attempts=attempt,
+                )
+            if self.max_total_tokens is not None and (self.input_tokens + self.output_tokens) >= self.max_total_tokens:
+                raise ProviderError(
+                    "Token budget exhausted",
+                    reason=FailureReason.BUDGET_EXHAUSTED,
+                    action=FailureAction.STOP,
+                    attempts=attempt,
+                )
+            backoff = min(self.max_delay_seconds, self.base_delay_seconds * (2 ** (attempt - 1)))
+            base = max(backoff, server_delay) if server_delay is not None and server_delay > 0 else backoff
+            sample = min(1.0, max(0.0, float(self._rand())))
+            delay = base + (base * self.jitter_ratio * sample)
+
         self._sleep_within_budget(
             delay,
             call_attempts=attempt,
             message="Elapsed time budget exhausted before retry",
+            category="retry",
         )
         return delay
 

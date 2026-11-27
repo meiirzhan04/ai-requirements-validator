@@ -1,5 +1,6 @@
 """Atomic requirement extraction with budget-aware batching and evidence grounding."""
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import inspect
 import re
@@ -22,6 +23,7 @@ from src.contracts.source import Contract, Count, Id, Text
 from src.evidence import ground
 from src.prompts.extraction import (
     EXTRACTION_PROMPT_VERSION,
+    EXTRACTION_QUOTE_REPAIR_HINT,
     EXTRACTION_REPAIR_HINT,
     EXTRACTION_SYSTEM_PROMPT,
 )
@@ -90,6 +92,9 @@ def _extract_markdown_table_header(text: str) -> tuple[str | None, list[str]]:
 
 
 def _estimate_unit_output_tokens(unit: _TargetUnit) -> int:
+    stripped = unit.text.strip()
+    if stripped.startswith("#") or stripped in ("---", "***", "___"):
+        return 24
     non_empty = [line for line in unit.text.splitlines() if line.strip()]
     header, body_lines = _extract_markdown_table_header(unit.text)
     if header is not None:
@@ -97,8 +102,8 @@ def _estimate_unit_output_tokens(unit: _TargetUnit) -> int:
         estimated_items = max(1, len(rows))
     else:
         estimated_items = max(1, len(non_empty))
-    # Estimate structured JSON overhead + verbatim quote + Russian summary per item.
-    return _estimate_tokens(unit.text) + estimated_items * 65
+    # Estimate structured JSON overhead + verbatim quote + concise Russian summary per item.
+    return _estimate_tokens(unit.text) + estimated_items * 42
 
 
 def _estimate_unit_input_tokens(unit: _TargetUnit) -> int:
@@ -192,9 +197,10 @@ def _detect_inherited_table_header(block: SourceBlock, last_header: str | None) 
 def plan_extraction_batches(
     document: ParsedDocument,
     *,
-    max_input_tokens: int = 12_000,
-    max_output_tokens: int = 4_000,
+    max_input_tokens: int = 24_000,
+    max_output_tokens: int = 12_000,
     include_boundary_context: bool = True,
+    max_blocks_per_batch: int = 38,
 ) -> list[_ExtractionBatch]:
     """Pack source blocks into input/output-budgeted batches with 20% headroom."""
     if max_input_tokens < 100 or max_output_tokens < 100:
@@ -237,6 +243,7 @@ def plan_extraction_batches(
         u_out = _estimate_unit_output_tokens(unit)
         if current_group and (
             unit.block.block_id in current_block_ids
+            or len(current_group) >= max_blocks_per_batch
             or current_in + u_in > input_cap
             or current_out + u_out > output_cap
         ):
@@ -401,6 +408,128 @@ def _call_provider(
     )
 
 
+def _consume_extraction_output(
+    *,
+    batch: _ExtractionBatch,
+    target_ids: list[str],
+    output: ExtractionOutput,
+    document: ParsedDocument,
+    ground_fn: GroundFn,
+    grounded_by_anchor: dict[tuple[str, str, int, int], tuple[str | None, str, str, EvidenceRef]],
+    context_reasons: dict[str, str],
+    block_completed_chunks: dict[str, int],
+    block_failed: set[str],
+    completed_batches: list[str],
+    incomplete_reasons: list[str],
+    uncertainties: list[str],
+) -> None:
+    target_set = set(target_ids)
+    batch_grounded_blocks: set[str] = set()
+    batch_context_blocks: set[str] = set()
+    batch_invalid_blocks: set[str] = set()
+
+    for item in output.items:
+        if item.block_id not in target_set:
+            uncertainties.append(
+                f"Пакет {batch.batch_id}: модель вернула элемент для внецелевого блока {item.block_id}."
+            )
+            continue
+        quote = item.original_quote.strip()
+        summary = item.summary.strip()
+        if not quote or not summary:
+            batch_invalid_blocks.add(item.block_id)
+            incomplete_reasons.append(
+                f"Блок {item.block_id} ({batch.batch_id}): пустая цитата или формулировка требования."
+            )
+            continue
+        candidate = EvidenceCandidate(
+            version=document.version.sha256,
+            block_id=item.block_id,
+            quote=item.original_quote,
+        )
+        grounded = ground_fn(candidate, document)
+        if not grounded.reference or not grounded.reference.grounded:
+            batch_invalid_blocks.add(item.block_id)
+            incomplete_reasons.append(
+                f"Блок {item.block_id} ({batch.batch_id}): цитата не подтверждена ({grounded.status.value}: {grounded.reason})."
+            )
+            continue
+        ref = grounded.reference
+        anchor = ref.anchor
+        orig_id = _normalize_optional_id(item.original_id)
+        if anchor not in grounded_by_anchor:
+            grounded_by_anchor[anchor] = (orig_id, item.category.value, summary, ref)
+        else:
+            existing_orig, existing_cat, existing_summary, existing_ref = grounded_by_anchor[anchor]
+            if existing_orig is None and orig_id is not None:
+                grounded_by_anchor[anchor] = (orig_id, existing_cat, existing_summary, existing_ref)
+        batch_grounded_blocks.add(item.block_id)
+
+    for ctx in output.context_blocks:
+        if ctx.block_id not in target_set:
+            continue
+        reason = ctx.reason.strip()
+        if not reason:
+            batch_invalid_blocks.add(ctx.block_id)
+            incomplete_reasons.append(
+                f"Блок {ctx.block_id} ({batch.batch_id}): указан контекстный блок без обоснования."
+            )
+            continue
+        context_reasons.setdefault(ctx.block_id, reason)
+        batch_context_blocks.add(ctx.block_id)
+
+    batch_fully_accounted = True
+    for unit in batch.units:
+        bid = unit.block.block_id
+        if bid in batch_invalid_blocks:
+            block_failed.add(bid)
+            batch_fully_accounted = False
+        elif bid in batch_grounded_blocks or bid in batch_context_blocks:
+            block_completed_chunks[bid] += 1
+        else:
+            block_failed.add(bid)
+            batch_fully_accounted = False
+            incomplete_reasons.append(
+                f"Блок {bid} ({batch.batch_id}) пропущен при извлечении требований."
+            )
+
+    if batch_fully_accounted:
+        completed_batches.append(batch.batch_id)
+
+
+def _execute_extraction_batch(
+    batch: _ExtractionBatch,
+    document: ParsedDocument,
+    *,
+    settings: ProviderSettings,
+    budget: QuotaBudget | None,
+    generate_fn: GenerateFn,
+) -> tuple[StageResult[ExtractionOutput] | None, ProviderError | None, int]:
+    est_in = sum(_estimate_unit_input_tokens(u) for u in batch.units)
+    est_out = sum(_estimate_unit_output_tokens(u) for u in batch.units)
+    payload = _build_payload(document, batch)
+    attempts = 0
+    for repair_attempt in range(2):
+        try:
+            stage_result = _call_provider(
+                generate_fn,
+                payload,
+                settings=settings,
+                budget=budget,
+                estimated_input_tokens=est_in,
+                estimated_output_tokens=est_out,
+            )
+            attempts += stage_result.attempts
+            return stage_result, None, attempts
+        except ProviderError as exc:
+            attempts += max(exc.attempts, 0)
+            if exc.action == FailureAction.REPAIR and repair_attempt == 0:
+                payload = _build_payload(document, batch, repair_hint=EXTRACTION_REPAIR_HINT)
+                continue
+            return None, exc, attempts
+    return None, None, attempts
+
+
 def extract_requirements(
     document: ParsedDocument,
     settings: ProviderSettings,
@@ -408,9 +537,11 @@ def extract_requirements(
     budget: QuotaBudget | None = None,
     generate_fn: GenerateFn = generate,
     ground_fn: GroundFn = ground,
-    max_input_tokens: int = 12_000,
-    max_output_tokens: int = 4_000,
+    max_input_tokens: int = 24_000,
+    max_output_tokens: int = 12_000,
     include_boundary_context: bool = True,
+    max_concurrency: int = 1,
+    retry_ungrounded_blocks: bool = False,
 ) -> ExtractionResult:
     """Extract grounded atomic requirements and per-block coverage in source order."""
     planned_blocks = [block.block_id for block in document.version.blocks]
@@ -450,44 +581,112 @@ def extract_requirements(
     known_in = 0
     known_out = 0
     has_known_usage = False
+    workers = max(1, max_concurrency)
 
-    idx = 0
-    while idx < len(queue):
-        batch = queue[idx]
-        idx += 1
-        target_ids = list(dict.fromkeys(unit.block.block_id for unit in batch.units))
-        est_in = sum(_estimate_unit_input_tokens(u) for u in batch.units)
-        est_out = sum(_estimate_unit_output_tokens(u) for u in batch.units)
-
-        payload = _build_payload(document, batch)
-        stage_result: StageResult[ExtractionOutput] | None = None
-        stop_all = False
-
-        for repair_attempt in range(2):
-            try:
-                stage_result = _call_provider(
-                    generate_fn,
-                    payload,
-                    settings=settings,
-                    budget=budget,
-                    estimated_input_tokens=est_in,
-                    estimated_output_tokens=est_out,
+    def _process_wave(
+        wave: list[_ExtractionBatch],
+    ) -> list[tuple[_ExtractionBatch, StageResult[ExtractionOutput] | None, ProviderError | None, int]]:
+        if workers <= 1 or len(wave) <= 1:
+            return [
+                (
+                    b,
+                    *_execute_extraction_batch(
+                        b, document, settings=settings, budget=budget, generate_fn=generate_fn
+                    ),
                 )
-                total_attempts += stage_result.attempts
+                for b in wave
+            ]
+        with ThreadPoolExecutor(max_workers=min(workers, len(wave))) as pool:
+            futures = [
+                (
+                    b,
+                    pool.submit(
+                        _execute_extraction_batch,
+                        b,
+                        document,
+                        settings=settings,
+                        budget=budget,
+                        generate_fn=generate_fn,
+                    ),
+                )
+                for b in wave
+            ]
+            return [(b, *fut.result()) for b, fut in futures]
+
+    pending_wave = list(queue)
+    stop_all = False
+    while pending_wave and not stop_all:
+        next_wave: list[_ExtractionBatch] = []
+        if workers <= 1:
+            # Preserve exact sequential early-stop semantics when running with 1 worker.
+            idx = 0
+            while idx < len(pending_wave):
+                batch = pending_wave[idx]
+                idx += 1
+                stage_result, exc, batch_attempts = _execute_extraction_batch(
+                    batch, document, settings=settings, budget=budget, generate_fn=generate_fn
+                )
+                total_attempts += batch_attempts
+                target_ids = list(dict.fromkeys(unit.block.block_id for unit in batch.units))
+                if exc is not None:
+                    if exc.action == FailureAction.SPLIT:
+                        split_batches = _split_batch_on_truncation(batch)
+                        if split_batches is not None:
+                            for unit in batch.units:
+                                block_planned_chunks[unit.block.block_id] -= 1
+                            for sub in split_batches:
+                                planned_batches.append(sub.batch_id)
+                                for unit in sub.units:
+                                    block_planned_chunks[unit.block.block_id] = (
+                                        block_planned_chunks.get(unit.block.block_id, 0) + 1
+                                    )
+                            pending_wave[idx:idx] = split_batches
+                            completed_batches.append(batch.batch_id)
+                            continue
+                        incomplete_reasons.append(
+                            f"Пакет {batch.batch_id} усечён (MAX_TOKENS) и не может быть разбит дальше."
+                        )
+                        block_failed.update(target_ids)
+                        continue
+                    incomplete_reasons.append(f"Пакет {batch.batch_id} не завершён: {exc}.")
+                    block_failed.update(target_ids)
+                    if exc.reason in _STOP_ALL_REASONS:
+                        for remaining_batch in pending_wave[idx:]:
+                            for unit in remaining_batch.units:
+                                block_failed.add(unit.block.block_id)
+                        stop_all = True
+                        break
+                    continue
+                if stage_result is None:
+                    continue
                 if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
                     known_in += stage_result.input_tokens
                     known_out += stage_result.output_tokens
                     has_known_usage = True
-                break
-            except ProviderError as exc:
-                total_attempts += max(exc.attempts, 0)
-                if exc.action == FailureAction.REPAIR and repair_attempt == 0:
-                    payload = _build_payload(document, batch, repair_hint=EXTRACTION_REPAIR_HINT)
-                    continue
+                _consume_extraction_output(
+                    batch=batch,
+                    target_ids=target_ids,
+                    output=stage_result.output,
+                    document=document,
+                    ground_fn=ground_fn,
+                    grounded_by_anchor=grounded_by_anchor,
+                    context_reasons=context_reasons,
+                    block_completed_chunks=block_completed_chunks,
+                    block_failed=block_failed,
+                    completed_batches=completed_batches,
+                    incomplete_reasons=incomplete_reasons,
+                    uncertainties=uncertainties,
+                )
+            break
+
+        wave_results = _process_wave(pending_wave)
+        for pos, (batch, stage_result, exc, batch_attempts) in enumerate(wave_results):
+            total_attempts += batch_attempts
+            target_ids = list(dict.fromkeys(unit.block.block_id for unit in batch.units))
+            if exc is not None:
                 if exc.action == FailureAction.SPLIT:
                     split_batches = _split_batch_on_truncation(batch)
                     if split_batches is not None:
-                        # Update chunk accounting for the split batch.
                         for unit in batch.units:
                             block_planned_chunks[unit.block.block_id] -= 1
                         for sub in split_batches:
@@ -496,103 +695,121 @@ def extract_requirements(
                                 block_planned_chunks[unit.block.block_id] = (
                                     block_planned_chunks.get(unit.block.block_id, 0) + 1
                                 )
-                        queue[idx:idx] = split_batches
+                        next_wave.extend(split_batches)
                         completed_batches.append(batch.batch_id)
-                        stage_result = None
-                        break
+                        continue
                     incomplete_reasons.append(
                         f"Пакет {batch.batch_id} усечён (MAX_TOKENS) и не может быть разбит дальше."
                     )
                     block_failed.update(target_ids)
-                    break
-
+                    continue
                 incomplete_reasons.append(f"Пакет {batch.batch_id} не завершён: {exc}.")
                 block_failed.update(target_ids)
                 if exc.reason in _STOP_ALL_REASONS:
                     stop_all = True
-                break
-
+                continue
+            if stage_result is None:
+                continue
+            if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
+                known_in += stage_result.input_tokens
+                known_out += stage_result.output_tokens
+                has_known_usage = True
+            _consume_extraction_output(
+                batch=batch,
+                target_ids=target_ids,
+                output=stage_result.output,
+                document=document,
+                ground_fn=ground_fn,
+                grounded_by_anchor=grounded_by_anchor,
+                context_reasons=context_reasons,
+                block_completed_chunks=block_completed_chunks,
+                block_failed=block_failed,
+                completed_batches=completed_batches,
+                incomplete_reasons=incomplete_reasons,
+                uncertainties=uncertainties,
+            )
         if stop_all:
-            for remaining_batch in queue[idx:]:
+            for remaining_batch in next_wave:
                 for unit in remaining_batch.units:
                     block_failed.add(unit.block.block_id)
             break
-        if stage_result is None:
-            continue
+        pending_wave = next_wave
 
-        output = stage_result.output
-        target_set = set(target_ids)
-        batch_grounded_blocks: set[str] = set()
-        batch_context_blocks: set[str] = set()
-        batch_invalid_blocks: set[str] = set()
-
-        for item in output.items:
-            if item.block_id not in target_set:
-                uncertainties.append(
-                    f"Пакет {batch.batch_id}: модель вернула элемент для внецелевого блока {item.block_id}."
-                )
-                continue
-            quote = item.original_quote.strip()
-            summary = item.summary.strip()
-            if not quote or not summary:
-                batch_invalid_blocks.add(item.block_id)
-                incomplete_reasons.append(
-                    f"Блок {item.block_id} ({batch.batch_id}): пустая цитата или формулировка требования."
-                )
-                continue
-            candidate = EvidenceCandidate(
-                version=document.version.sha256,
-                block_id=item.block_id,
-                quote=item.original_quote,
+    # Optional single targeted repair pass for blocks that failed verbatim grounding or were omitted
+    # during live extraction (counts against attempts/budget; never promotes fuzzy matches).
+    if retry_ungrounded_blocks and not stop_all and block_failed:
+        all_blocks = document.version.blocks
+        block_by_id = {b.block_id: b for b in all_blocks}
+        failed_ordered = [bid for bid in planned_blocks if bid in block_failed]
+        if failed_ordered:
+            repair_units = tuple(
+                _TargetUnit(block=block_by_id[bid], text=block_by_id[bid].text)
+                for bid in failed_ordered
+                if bid in block_by_id
             )
-            grounded = ground_fn(candidate, document)
-            if not grounded.reference or not grounded.reference.grounded:
-                batch_invalid_blocks.add(item.block_id)
-                incomplete_reasons.append(
-                    f"Блок {item.block_id} ({batch.batch_id}): цитата не подтверждена ({grounded.status.value}: {grounded.reason})."
+            if repair_units:
+                repair_batch = _ExtractionBatch(batch_id="extract-repair", units=repair_units)
+                planned_batches.append(repair_batch.batch_id)
+                est_in = sum(_estimate_unit_input_tokens(u) for u in repair_units)
+                est_out = sum(_estimate_unit_output_tokens(u) for u in repair_units)
+                payload = _build_payload(
+                    document,
+                    repair_batch,
+                    repair_hint=EXTRACTION_QUOTE_REPAIR_HINT,
                 )
-                continue
-            ref = grounded.reference
-            anchor = ref.anchor
-            orig_id = _normalize_optional_id(item.original_id)
-            if anchor not in grounded_by_anchor:
-                grounded_by_anchor[anchor] = (orig_id, item.category.value, summary, ref)
-            else:
-                existing_orig, existing_cat, existing_summary, existing_ref = grounded_by_anchor[anchor]
-                if existing_orig is None and orig_id is not None:
-                    grounded_by_anchor[anchor] = (orig_id, existing_cat, existing_summary, existing_ref)
-            batch_grounded_blocks.add(item.block_id)
-
-        for ctx in output.context_blocks:
-            if ctx.block_id not in target_set:
-                continue
-            reason = ctx.reason.strip()
-            if not reason:
-                batch_invalid_blocks.add(ctx.block_id)
-                incomplete_reasons.append(
-                    f"Блок {ctx.block_id} ({batch.batch_id}): указан контекстный блок без обоснования."
-                )
-                continue
-            context_reasons.setdefault(ctx.block_id, reason)
-            batch_context_blocks.add(ctx.block_id)
-
-        batch_fully_accounted = True
-        for unit in batch.units:
-            bid = unit.block.block_id
-            if bid in batch_invalid_blocks:
-                block_failed.add(bid)
-                batch_fully_accounted = False
-            elif bid in batch_grounded_blocks or bid in batch_context_blocks:
-                block_completed_chunks[bid] += 1
-            else:
-                block_failed.add(bid)
-                batch_fully_accounted = False
-                incomplete_reasons.append(
-                    f"Блок {bid} ({batch.batch_id}) пропущен при извлечении требований."
-                )
-
-        if batch_fully_accounted:
-            completed_batches.append(batch.batch_id)
+                try:
+                    repair_res = _call_provider(
+                        generate_fn,
+                        payload,
+                        settings=settings,
+                        budget=budget,
+                        estimated_input_tokens=est_in,
+                        estimated_output_tokens=est_out,
+                    )
+                    total_attempts += repair_res.attempts
+                    if repair_res.input_tokens is not None and repair_res.output_tokens is not None:
+                        known_in += repair_res.input_tokens
+                        known_out += repair_res.output_tokens
+                        has_known_usage = True
+                    # Remove stale partial anchors/reasons for retried blocks before re-evaluating cleanly.
+                    retry_set = set(failed_ordered)
+                    for anchor in [a for a, rec in grounded_by_anchor.items() if rec[3].block_id in retry_set]:
+                        del grounded_by_anchor[anchor]
+                    for bid in retry_set:
+                        context_reasons.pop(bid, None)
+                        block_failed.discard(bid)
+                        block_completed_chunks[bid] = 0
+                        block_planned_chunks[bid] = 1
+                    repair_reasons: list[str] = []
+                    _consume_extraction_output(
+                        batch=repair_batch,
+                        target_ids=failed_ordered,
+                        output=repair_res.output,
+                        document=document,
+                        ground_fn=ground_fn,
+                        grounded_by_anchor=grounded_by_anchor,
+                        context_reasons=context_reasons,
+                        block_completed_chunks=block_completed_chunks,
+                        block_failed=block_failed,
+                        completed_batches=completed_batches,
+                        incomplete_reasons=repair_reasons,
+                        uncertainties=uncertainties,
+                    )
+                    recovered = retry_set - block_failed
+                    if recovered:
+                        incomplete_reasons = [
+                            r for r in incomplete_reasons if not any(f"Блок {bid} " in r for bid in recovered)
+                        ]
+                        # Mark original batches complete if all their blocks are now recovered.
+                        for orig_batch in queue:
+                            if orig_batch.batch_id not in completed_batches:
+                                orig_ids = {u.block.block_id for u in orig_batch.units}
+                                if orig_ids and not (orig_ids & block_failed):
+                                    completed_batches.append(orig_batch.batch_id)
+                    incomplete_reasons.extend(repair_reasons)
+                except ProviderError as exc:
+                    total_attempts += max(exc.attempts, 0)
+                    incomplete_reasons.append(f"Пакет {repair_batch.batch_id} не завершён: {exc}.")
 
     # Determine fully completed blocks first so requirements strictly align with completed blocks
     # (preserving ValidationReport's disjoint cited_blocks | context_blocks == completed_blocks invariant).

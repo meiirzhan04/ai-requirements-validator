@@ -1,9 +1,11 @@
 """Holistic cross-section audit against the 5 ISO set criteria and 8 IEEE criteria."""
 from collections import defaultdict
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import inspect
 import re
+from typing import Any
 
 from pydantic import Field
 
@@ -22,6 +24,7 @@ from src.contracts import (
     ProviderSettings,
     QualityCriterion,
     Requirement,
+    RequirementCategory,
     SemanticStatus,
     Severity,
     StageResult,
@@ -30,6 +33,7 @@ from src.contracts import (
 from src.contracts.source import Contract, Count, Id, Text
 from src.evidence import ground
 from src.prompts.holistic import (
+    HOLISTIC_LOGIC_SYSTEM_PROMPT,
     HOLISTIC_PROMPT_VERSION,
     HOLISTIC_REPAIR_HINT,
     HOLISTIC_SYSTEM_PROMPT,
@@ -168,9 +172,10 @@ def build_cross_section_groups(
     requirements: list[Requirement],
     document: ParsedDocument,
     *,
-    max_requirements_per_group: int = 24,
-    max_passages_per_group: int = 36,
+    max_requirements_per_group: int = 80,
+    max_passages_per_group: int = 120,
     max_cross_groups: int = 8,
+    max_whole_spec_tokens: int = 24_000,
 ) -> list[CrossSectionGroup]:
     """Index entities/endpoints/conditions and build cross-section comparison groups."""
     if not requirements:
@@ -179,13 +184,21 @@ def build_cross_section_groups(
     block_order = {b.block_id: idx for idx, b in enumerate(document.version.blocks)}
     block_section = {b.block_id: b.location.section for b in document.version.blocks}
 
-    # Small document optimization: one whole-specification group fits in a single pass.
+    # Whole-specification optimization: keep small/medium documents in one full-visibility pass
+    # so cross-section contradictions and gaps see the entire document with zero artificial scope splits.
     unique_blocks = sorted(
         {r.source.block_id for r in requirements if r.source.block_id in block_order},
         key=lambda bid: block_order[bid],
     )
-    if len(requirements) <= max_requirements_per_group and len(unique_blocks) <= max_passages_per_group:
-        return [
+    est_doc_tokens = _estimate_tokens("".join(b.text for b in document.version.blocks)) + sum(
+        _estimate_tokens(r.summary) + _estimate_tokens(r.source.quote) for r in requirements
+    )
+    if (
+        len(requirements) <= max_requirements_per_group
+        and len(unique_blocks) <= max_passages_per_group
+        and est_doc_tokens <= max_whole_spec_tokens
+    ):
+        whole_groups = [
             CrossSectionGroup(
                 group_id="whole-spec",
                 topic_keywords=("full-document",),
@@ -193,6 +206,37 @@ def build_cross_section_groups(
                 block_ids=tuple(unique_blocks),
             )
         ]
+        # For non-trivial specs that mix functional/business rules with acceptance/interface rules,
+        # add a dedicated focused cross-rule consistency pass (runs in parallel with whole-spec)
+        # so acceptance-vs-rule and pairwise rule contradictions are not diluted by API/schema tables.
+        core_categories = (
+            RequirementCategory.BUSINESS,
+            RequirementCategory.FUNCTIONAL,
+            RequirementCategory.QUALITY,
+            RequirementCategory.DATA,
+        )
+        core_reqs = [r for r in requirements if r.category in core_categories]
+        acceptance_reqs = [r for r in requirements if r.category == RequirementCategory.ACCEPTANCE]
+        if len(requirements) >= 8 and len(core_reqs) >= 2 and acceptance_reqs:
+            focused_reqs = [
+                r for r in requirements if r.category in (*core_categories, RequirementCategory.ACCEPTANCE)
+            ]
+            focused_blocks = tuple(
+                sorted(
+                    {r.source.block_id for r in focused_reqs if r.source.block_id in block_order},
+                    key=lambda bid: block_order[bid],
+                )
+            )
+            if len(focused_blocks) < len(unique_blocks):
+                whole_groups.append(
+                    CrossSectionGroup(
+                        group_id="rules-acceptance",
+                        topic_keywords=("functional-vs-acceptance", "pairwise-rules"),
+                        requirement_ids=tuple(r.req_id for r in focused_reqs),
+                        block_ids=focused_blocks,
+                    )
+                )
+        return whole_groups
 
     # Long document indexing: connect distant sections sharing entities, endpoints, or terms.
     term_to_reqs: dict[str, list[Requirement]] = defaultdict(list)
@@ -556,18 +600,152 @@ def _split_group(
     return parts
 
 
+def _format_structural_signals(
+    structural_signals: list[Any] | None,
+    allowed_blocks: set[str],
+    *,
+    limit: int = 25,
+) -> list[str]:
+    if not structural_signals:
+        return []
+    seen: set[tuple[str, str]] = set()
+    formatted: list[str] = []
+    for sig in structural_signals:
+        src = getattr(sig, "source", None)
+        kind = getattr(sig, "kind", None)
+        if src is None or kind is None or src.block_id not in allowed_blocks:
+            continue
+        key = (str(kind), src.block_id)
+        if key in seen:
+            continue
+        seen.add(key)
+        snippet = _WHITESPACE_RE.sub(" ", src.quote).strip()[:80]
+        formatted.append(f"{kind} @ {src.block_id}: {snippet}")
+        if len(formatted) >= limit:
+            break
+    return formatted
+
+
+def _execute_holistic_group(
+    *,
+    group: CrossSectionGroup,
+    document: ParsedDocument,
+    req_map: dict[str, Requirement],
+    block_map: dict[str, Any],
+    block_order: dict[str, int],
+    all_block_ids: list[str],
+    effective_inspected: set[str],
+    has_uninspected_scope: bool,
+    max_passages_per_group: int,
+    structural_signals: list[Any] | None,
+    settings: ProviderSettings,
+    budget: QuotaBudget | None,
+    generate_fn: GenerateFn,
+) -> tuple[StageResult[HolisticAuditOutput] | None, ProviderError | None, int, set[str], bool]:
+    if group.group_id == "whole-spec":
+        scope_candidates = sorted(effective_inspected, key=lambda bid: block_order[bid])
+        if len(scope_candidates) <= max_passages_per_group:
+            selected_passage_ids = scope_candidates
+        else:
+            req_blks = sorted(effective_inspected & set(group.block_ids), key=lambda bid: block_order[bid])
+            selected_passage_ids = req_blks[:max_passages_per_group]
+    else:
+        selected_passage_ids = sorted(
+            effective_inspected & set(group.block_ids) if group.block_ids else effective_inspected,
+            key=lambda bid: block_order[bid],
+        )[:max_passages_per_group]
+
+    group_inspected_set = set(selected_passage_ids)
+    group_has_uninspected_scope = (
+        has_uninspected_scope or group_inspected_set != set(all_block_ids)
+    )
+    passages = [
+        HolisticPassageInput(
+            block_id=bid,
+            section=block_map[bid].location.section,
+            text=block_map[bid].text,
+        )
+        for bid in selected_passage_ids
+        if bid in block_map
+    ]
+    req_inputs = [
+        HolisticRequirementInput(
+            req_id=req_map[rid].req_id,
+            original_id=req_map[rid].original_id,
+            category=req_map[rid].category.value,
+            summary=req_map[rid].summary,
+            block_id=req_map[rid].source.block_id,
+            quote=req_map[rid].source.quote,
+        )
+        for rid in group.requirement_ids
+        if rid in req_map
+    ]
+    group_signals = (
+        []
+        if group.group_id == "rules-acceptance"
+        else _format_structural_signals(structural_signals, group_inspected_set)
+    )
+    system_prompt = (
+        HOLISTIC_LOGIC_SYSTEM_PROMPT
+        if group.group_id == "rules-acceptance"
+        else HOLISTIC_SYSTEM_PROMPT
+    )
+
+    def _make_payload(repair_hint: str | None = None) -> HolisticGroupPayload:
+        return HolisticGroupPayload(
+            system_instruction=system_prompt,
+            prompt_version=HOLISTIC_PROMPT_VERSION,
+            document_name=document.version.name,
+            group_id=group.group_id,
+            topic_keywords=list(group.topic_keywords),
+            criteria_catalog=[c.value for c in _WHOLE_SET_ORDERED],
+            inspected_block_ids=selected_passage_ids,
+            has_uninspected_scope=group_has_uninspected_scope,
+            structural_signals=group_signals,
+            requirements=req_inputs,
+            passages=passages,
+            repair_hint=repair_hint,
+        )
+
+    payload = _make_payload()
+    est_in = _estimate_tokens(payload.model_dump_json(exclude={"system_instruction"}, exclude_none=True))
+    est_out = 2600
+    attempts = 0
+    for repair_attempt in range(2):
+        try:
+            stage_result = _call_provider(
+                generate_fn,
+                payload,
+                settings=settings,
+                budget=budget,
+                estimated_input_tokens=est_in,
+                estimated_output_tokens=est_out,
+            )
+            attempts += stage_result.attempts
+            return stage_result, None, attempts, group_inspected_set, group_has_uninspected_scope
+        except ProviderError as exc:
+            attempts += max(exc.attempts, 0)
+            if exc.action == FailureAction.REPAIR and repair_attempt == 0:
+                payload = _make_payload(repair_hint=HOLISTIC_REPAIR_HINT)
+                continue
+            return None, exc, attempts, group_inspected_set, group_has_uninspected_scope
+    return None, None, attempts, group_inspected_set, group_has_uninspected_scope
+
+
 def audit_holistic_set(
     requirements: list[Requirement],
     document: ParsedDocument,
     settings: ProviderSettings,
     *,
     inspected_blocks: set[str] | list[str] | None = None,
+    structural_signals: list[Any] | None = None,
     budget: QuotaBudget | None = None,
     generate_fn: GenerateFn = generate,
     ground_fn: GroundFn = ground,
-    max_requirements_per_group: int = 24,
-    max_passages_per_group: int = 36,
+    max_requirements_per_group: int = 80,
+    max_passages_per_group: int = 120,
     finding_id_start: int = 1,
+    max_concurrency: int = 1,
 ) -> HolisticAuditResult:
     """Audit whole-specification ISO/IEEE properties across cross-section groups."""
     all_block_ids = [b.block_id for b in document.version.blocks]
@@ -613,114 +791,15 @@ def audit_holistic_set(
     known_out = 0
     has_known_usage = False
     temp_finding_seq = 0
+    workers = max(1, max_concurrency)
 
-    queue = list(groups)
-    q_idx = 0
-    while q_idx < len(queue):
-        group = queue[q_idx]
-        q_idx += 1
-
-        if group.group_id == "whole-spec":
-            # Include all inspected blocks (including context blocks) when they fit in the passage budget.
-            scope_candidates = sorted(effective_inspected, key=lambda bid: block_order[bid])
-            if len(scope_candidates) <= max_passages_per_group:
-                selected_passage_ids = scope_candidates
-            else:
-                req_blks = sorted(effective_inspected & set(group.block_ids), key=lambda bid: block_order[bid])
-                selected_passage_ids = req_blks[:max_passages_per_group]
-        else:
-            selected_passage_ids = sorted(
-                effective_inspected & set(group.block_ids) if group.block_ids else effective_inspected,
-                key=lambda bid: block_order[bid],
-            )[:max_passages_per_group]
-
-        group_inspected_set = set(selected_passage_ids)
-        group_has_uninspected_scope = (
-            has_uninspected_scope or group_inspected_set != set(all_block_ids)
-        )
-        passages = [
-            HolisticPassageInput(
-                block_id=bid,
-                section=block_map[bid].location.section,
-                text=block_map[bid].text,
-            )
-            for bid in selected_passage_ids
-            if bid in block_map
-        ]
-        req_inputs = [
-            HolisticRequirementInput(
-                req_id=req_map[rid].req_id,
-                original_id=req_map[rid].original_id,
-                category=req_map[rid].category.value,
-                summary=req_map[rid].summary,
-                block_id=req_map[rid].source.block_id,
-                quote=req_map[rid].source.quote,
-            )
-            for rid in group.requirement_ids
-            if rid in req_map
-        ]
-
-        def _make_payload(repair_hint: str | None = None) -> HolisticGroupPayload:
-            return HolisticGroupPayload(
-                system_instruction=HOLISTIC_SYSTEM_PROMPT,
-                prompt_version=HOLISTIC_PROMPT_VERSION,
-                document_name=document.version.name,
-                group_id=group.group_id,
-                topic_keywords=list(group.topic_keywords),
-                criteria_catalog=[c.value for c in _WHOLE_SET_ORDERED],
-                inspected_block_ids=selected_passage_ids,
-                has_uninspected_scope=group_has_uninspected_scope,
-                requirements=req_inputs,
-                passages=passages,
-                repair_hint=repair_hint,
-            )
-
-        payload = _make_payload()
-        est_in = _estimate_tokens(payload.model_dump_json())
-        est_out = 1800
-        stage_result: StageResult[HolisticAuditOutput] | None = None
-        stop_all = False
-
-        for repair_attempt in range(2):
-            try:
-                stage_result = _call_provider(
-                    generate_fn,
-                    payload,
-                    settings=settings,
-                    budget=budget,
-                    estimated_input_tokens=est_in,
-                    estimated_output_tokens=est_out,
-                )
-                total_attempts += stage_result.attempts
-                if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
-                    known_in += stage_result.input_tokens
-                    known_out += stage_result.output_tokens
-                    has_known_usage = True
-                break
-            except ProviderError as exc:
-                total_attempts += max(exc.attempts, 0)
-                if exc.action == FailureAction.REPAIR and repair_attempt == 0:
-                    payload = _make_payload(repair_hint=HOLISTIC_REPAIR_HINT)
-                    continue
-                if exc.action == FailureAction.SPLIT:
-                    sub_groups = _split_group(group, req_map, block_order)
-                    if sub_groups is not None:
-                        planned_groups.extend(sg.group_id for sg in sub_groups)
-                        queue[q_idx:q_idx] = sub_groups
-                        completed_groups.append(group.group_id)
-                        stage_result = None
-                        break
-                incomplete_reasons.append(f"Группа {group.group_id} целостного аудита не завершена: {exc}.")
-                if exc.reason in _STOP_ALL_REASONS:
-                    stop_all = True
-                break
-
-        if stop_all:
-            break
-        if stage_result is None:
-            continue
-
-        output = stage_result.output
+    def _consume_group_output(
+        group: CrossSectionGroup,
+        output: HolisticAuditOutput,
+        group_inspected_set: set[str],
+        group_has_uninspected_scope: bool,
+    ) -> None:
+        nonlocal temp_finding_seq
         group_clean = True
         local_key_to_draft: dict[str, _DraftHolisticFinding] = {}
 
@@ -773,8 +852,6 @@ def audit_holistic_set(
             )
             group_clean = False
 
-        # Synchronize finding criteria strictly with the FAIL evaluations citing each finding,
-        # and exclude unreferenced orphan findings so ValidationReport's cited == declared invariant holds.
         cited_criteria_by_key: dict[str, set[QualityCriterion]] = defaultdict(set)
         for crit, ev in seen_group_criteria.items():
             if ev.status != CriterionStatus.FAIL:
@@ -816,7 +893,6 @@ def audit_holistic_set(
                 if k in local_key_to_temp_id
             ]
             if ev.status == CriterionStatus.FAIL and not resolved_ids:
-                # Candidate defect was rejected (e.g. missing 2nd quote) -> cannot keep unsupported FAIL.
                 criterion_observations[crit].append(
                     (
                         CriterionStatus.UNKNOWN,
@@ -831,6 +907,101 @@ def audit_holistic_set(
 
         if group_clean:
             completed_groups.append(group.group_id)
+
+    pending_wave = list(groups)
+    stop_all = False
+    while pending_wave and not stop_all:
+        if workers <= 1 or len(pending_wave) <= 1:
+            q_idx = 0
+            while q_idx < len(pending_wave):
+                group = pending_wave[q_idx]
+                q_idx += 1
+                stage_result, exc, grp_attempts, grp_inspected, grp_has_uninspected = _execute_holistic_group(
+                    group=group,
+                    document=document,
+                    req_map=req_map,
+                    block_map=block_map,
+                    block_order=block_order,
+                    all_block_ids=all_block_ids,
+                    effective_inspected=effective_inspected,
+                    has_uninspected_scope=has_uninspected_scope,
+                    max_passages_per_group=max_passages_per_group,
+                    structural_signals=structural_signals,
+                    settings=settings,
+                    budget=budget,
+                    generate_fn=generate_fn,
+                )
+                total_attempts += grp_attempts
+                if exc is not None:
+                    if exc.action == FailureAction.SPLIT:
+                        sub_groups = _split_group(group, req_map, block_order)
+                        if sub_groups is not None:
+                            planned_groups.extend(sg.group_id for sg in sub_groups)
+                            pending_wave[q_idx:q_idx] = sub_groups
+                            completed_groups.append(group.group_id)
+                            continue
+                    incomplete_reasons.append(f"Группа {group.group_id} целостного аудита не завершена: {exc}.")
+                    if exc.reason in _STOP_ALL_REASONS:
+                        stop_all = True
+                        break
+                    continue
+                if stage_result is None:
+                    continue
+                if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
+                    known_in += stage_result.input_tokens
+                    known_out += stage_result.output_tokens
+                    has_known_usage = True
+                _consume_group_output(group, stage_result.output, grp_inspected, grp_has_uninspected)
+            break
+
+        next_wave: list[CrossSectionGroup] = []
+        with ThreadPoolExecutor(max_workers=min(workers, len(pending_wave))) as pool:
+            futures = [
+                (
+                    g,
+                    pool.submit(
+                        _execute_holistic_group,
+                        group=g,
+                        document=document,
+                        req_map=req_map,
+                        block_map=block_map,
+                        block_order=block_order,
+                        all_block_ids=all_block_ids,
+                        effective_inspected=effective_inspected,
+                        has_uninspected_scope=has_uninspected_scope,
+                        max_passages_per_group=max_passages_per_group,
+                        structural_signals=structural_signals,
+                        settings=settings,
+                        budget=budget,
+                        generate_fn=generate_fn,
+                    ),
+                )
+                for g in pending_wave
+            ]
+            wave_results = [(g, *fut.result()) for g, fut in futures]
+
+        for group, stage_result, exc, grp_attempts, grp_inspected, grp_has_uninspected in wave_results:
+            total_attempts += grp_attempts
+            if exc is not None:
+                if exc.action == FailureAction.SPLIT:
+                    sub_groups = _split_group(group, req_map, block_order)
+                    if sub_groups is not None:
+                        planned_groups.extend(sg.group_id for sg in sub_groups)
+                        next_wave.extend(sub_groups)
+                        completed_groups.append(group.group_id)
+                        continue
+                incomplete_reasons.append(f"Группа {group.group_id} целостного аудита не завершена: {exc}.")
+                if exc.reason in _STOP_ALL_REASONS:
+                    stop_all = True
+                continue
+            if stage_result is None:
+                continue
+            if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
+                known_in += stage_result.input_tokens
+                known_out += stage_result.output_tokens
+                has_known_usage = True
+            _consume_group_output(group, stage_result.output, grp_inspected, grp_has_uninspected)
+        pending_wave = next_wave
 
     dedup_findings, id_map = deduplicate_findings(
         raw_findings,

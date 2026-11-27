@@ -1,9 +1,12 @@
 """End-to-end synchronous AI validation pipeline orchestrating all review stages."""
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from functools import lru_cache
 import logging
 import subprocess
+import threading
 import time
 from typing import Any
 from uuid import uuid4
@@ -40,7 +43,7 @@ from src.prompts.holistic import HOLISTIC_PROMPT_VERSION
 from src.prompts.individual import INDIVIDUAL_PROMPT_VERSION
 from src.prompts.questions import QUESTIONS_PROMPT_VERSION
 from src.prompts.verification import VERIFICATION_PROMPT_VERSION
-from src.provider import FailureAction, FailureReason, ProviderError, QuotaBudget, generate
+from src.provider import FailureAction, FailureReason, ProviderError, QuotaBudget, generate, provider_session
 from src.readiness import decide
 
 try:
@@ -52,7 +55,7 @@ except ImportError:  # pragma: no cover - fallback only when #4 is not yet merge
 
 logger = logging.getLogger(__name__)
 
-PIPELINE_PROMPT_VERSION = "pipeline-v1"
+PIPELINE_PROMPT_VERSION = "pipeline-v2"
 STAGE_PROMPT_VERSIONS = (
     EXTRACTION_PROMPT_VERSION,
     INDIVIDUAL_PROMPT_VERSION,
@@ -187,6 +190,7 @@ def _remap_evaluations(
 
 def _collect_material_uncertainties(
     findings: list[Finding],
+    indiv: IndividualAuditResult | None,
     holistic: HolisticAuditResult | None,
     clarification: QuestionGenerationResult | None,
 ) -> list[str]:
@@ -194,20 +198,30 @@ def _collect_material_uncertainties(
     if clarification is not None:
         uncertainties.extend(clarification.blocking_uncertainties)
 
+    recorded_reasons: set[str] = set()
     for finding in findings:
         if finding.severity in (Severity.CRITICAL, Severity.MAJOR) and finding.semantic_status in (
             SemanticStatus.UNCHECKED,
             SemanticStatus.UNCERTAIN,
         ):
+            recorded_reasons.add(finding.verification_reason.strip())
             uncertainties.append(
                 f"Открытая гипотеза {finding.finding_id} ({finding.severity.value}, {finding.semantic_status.value}): "
                 f"{finding.verification_reason}"
             )
 
+    if indiv is not None:
+        for note in indiv.uncertainties:
+            if "одноцитатное противоречие" in note:
+                uncertainties.append(note)
+
     if holistic is not None:
         for note in holistic.uncertainties:
-            if "непроверенные фрагменты" in note or "две независимые подтверждённые цитаты" in note:
-                uncertainties.append(note)
+            cleaned = note.strip()
+            if cleaned in recorded_reasons:
+                continue
+            if "непроверенные фрагменты" in cleaned or "две независимые подтверждённые цитаты" in cleaned:
+                uncertainties.append(cleaned)
 
     return _dedup_non_empty(uncertainties)
 
@@ -318,14 +332,15 @@ def execute_pipeline(
     budget: QuotaBudget | None = None,
     run_id: str | None = None,
     agent_revision: str | None = None,
-    max_input_tokens: int = 12_000,
-    max_output_tokens: int = 4_000,
-    max_requirements_per_batch: int = 6,
-    max_requirements_per_group: int = 24,
-    verification_batch_size: int = 8,
-    question_batch_size: int = 8,
+    max_input_tokens: int = 24_000,
+    max_output_tokens: int = 12_000,
+    max_requirements_per_batch: int = 10,
+    max_requirements_per_group: int = 80,
+    verification_batch_size: int = 16,
+    question_batch_size: int = 16,
+    max_concurrency: int | None = None,
 ) -> ValidationReport:
-    """Orchestrate the full validation pipeline with real progress events and strict coverage."""
+    """Orchestrate the full validation pipeline with bounded parallelism and strict coverage."""
     if not isinstance(document, ParsedDocument):
         raise ValueError("document must be a valid ParsedDocument")
     if not isinstance(settings, ProviderSettings):
@@ -336,21 +351,31 @@ def execute_pipeline(
     started_mono = time.monotonic()
     revision = agent_revision or _detect_agent_revision()
     active_budget = budget or QuotaBudget()
+    effective_concurrency = (
+        max(1, max_concurrency)
+        if max_concurrency is not None
+        else (3 if generate_fn is generate else 1)
+    )
+    emit_lock = threading.Lock()
+
+    def _safe_emit(stage: PipelineStage, state: str, message: str) -> None:
+        if on_progress is None:
+            return
+        with emit_lock:
+            on_progress(ProgressEvent(stage=stage, state=state, message=message))
 
     blocks = document.version.blocks
     block_order = {b.block_id: idx for idx, b in enumerate(blocks)}
 
     # Stage 1: Structural pre-scan and input inventory check.
-    _emit(
-        on_progress,
+    _safe_emit(
         PipelineStage.INGEST,
         "started",
         f"Проверка состава документа «{document.version.name}» ({len(blocks)} блоков).",
     )
     if not blocks:
         if not document.unread_pages and not document.blank_pages and not document.diagnostics:
-            _emit(
-                on_progress,
+            _safe_emit(
                 PipelineStage.INGEST,
                 "failed",
                 "Документ не содержит текстовых блоков или диагностик страниц.",
@@ -366,14 +391,12 @@ def execute_pipeline(
                 f"Пустые страницы без текста: {', '.join(map(str, document.blank_pages))}."
             )
         reasons.append("Нет доступных для проверки исходных блоков.")
-        _emit(
-            on_progress,
+        _safe_emit(
             PipelineStage.INGEST,
             "failed",
             "Документ не содержит читаемых текстовых блоков; анализ завершён без обращения к модели.",
         )
-        _emit(
-            on_progress,
+        _safe_emit(
             PipelineStage.REPORT,
             "started",
             "Формирование отчёта о нечитаемом документе.",
@@ -401,8 +424,7 @@ def execute_pipeline(
             output_tokens=None,
             decide_fn=decide_fn,
         )
-        _emit(
-            on_progress,
+        _safe_emit(
             PipelineStage.REPORT,
             "completed",
             f"Отчёт сформирован: готовность={report.verdict.readiness.value}.",
@@ -410,8 +432,7 @@ def execute_pipeline(
         return report
 
     structural_signals = _scan_structure(document) if _scan_structure is not None else []
-    _emit(
-        on_progress,
+    _safe_emit(
         PipelineStage.INGEST,
         "completed",
         f"Проверено блоков: {len(blocks)}, структурных сигналов: {len(structural_signals)}.",
@@ -419,8 +440,7 @@ def execute_pipeline(
 
     # Fail fast with explicit sanitized ProviderError when live credentials are missing.
     if generate_fn is generate and not settings.api_key:
-        _emit(
-            on_progress,
+        _safe_emit(
             PipelineStage.EXTRACT,
             "failed",
             "Отсутствует API-ключ провайдера Gemini.",
@@ -431,215 +451,279 @@ def execute_pipeline(
             action=FailureAction.STOP,
         )
 
-    logger.info("run=%s stage=start blocks=%d signals=%d", active_run_id, len(blocks), len(structural_signals))
-
-    # Stage 2: Requirement extraction & grounding.
-    _emit(
-        on_progress,
-        PipelineStage.EXTRACT,
-        "started",
-        f"Извлечение атомарных требований из {len(blocks)} блоков.",
+    logger.info(
+        "run=%s stage=start blocks=%d signals=%d concurrency=%d",
+        active_run_id,
+        len(blocks),
+        len(structural_signals),
+        effective_concurrency,
     )
-    extraction = extract_requirements(
-        document,
-        settings,
-        budget=active_budget,
-        generate_fn=generate_fn,
-        ground_fn=ground_fn,
-        max_input_tokens=max_input_tokens,
-        max_output_tokens=max_output_tokens,
-    )
-    extraction_blocks, context_blocks, scope_reasons = _reconcile_extraction_scope(document, extraction)
 
-    incomplete_reasons: list[str] = [*scope_reasons, *extraction.incomplete_reasons]
-    if not extraction.batches.complete:
-        incomplete_reasons.append(
-            f"Завершено пакетов извлечения: {len(extraction.batches.completed)} из {len(extraction.batches.planned)}."
-        )
-
-    if extraction_blocks.completed:
-        _emit(
-            on_progress,
+    session_ctx = provider_session(settings) if generate_fn is generate else nullcontext()
+    with session_ctx:
+        # Stage 2: Requirement extraction & grounding.
+        t_stage = time.monotonic()
+        _safe_emit(
             PipelineStage.EXTRACT,
-            "completed",
-            f"Извлечено требований: {len(extraction.requirements)} "
-            f"(обработано блоков {len(extraction_blocks.completed)}/{len(extraction_blocks.planned)}).",
-        )
-    else:
-        _emit(
-            on_progress,
-            PipelineStage.EXTRACT,
-            "failed",
-            "Этап извлечения не завершил ни одного блока.",
-        )
-
-    requirements = extraction.requirements
-    completed_block_set = set(extraction_blocks.completed)
-
-    indiv: IndividualAuditResult | None = None
-    holistic: HolisticAuditResult | None = None
-    verification: VerificationResult | None = None
-    clarification: QuestionGenerationResult | None = None
-
-    final_findings: list[Finding] = []
-    final_evaluations: list[CriterionEvaluation] = []
-    final_questions: list[Question] = []
-
-    if not requirements:
-        incomplete_reasons.append("Не извлечено ни одного требования для проведения аудита.")
-        individual_requirements = WorkSet(planned=[], completed=[])
-        audit_batches = extraction.batches
-        cross_section_groups = WorkSet(planned=[], completed=[])
-    else:
-        # Stage 3: Individual requirement audit (9 ISO 29148 criteria).
-        _emit(
-            on_progress,
-            PipelineStage.INDIVIDUAL,
             "started",
-            f"Индивидуальный аудит {len(requirements)} требований по 9 критериям ISO 29148.",
+            f"Извлечение атомарных требований из {len(blocks)} блоков.",
         )
-        indiv = audit_individual_requirements(
-            requirements,
+        extraction = extract_requirements(
             document,
             settings,
-            inspected_blocks=completed_block_set,
             budget=active_budget,
             generate_fn=generate_fn,
             ground_fn=ground_fn,
             max_input_tokens=max_input_tokens,
             max_output_tokens=max_output_tokens,
-            max_requirements_per_batch=max_requirements_per_batch,
+            max_concurrency=effective_concurrency,
+            retry_ungrounded_blocks=(generate_fn is generate),
         )
-        incomplete_reasons.extend(indiv.incomplete_reasons)
-        if not indiv.individual_requirements.complete:
+        extraction_blocks, context_blocks, scope_reasons = _reconcile_extraction_scope(document, extraction)
+
+        incomplete_reasons: list[str] = [*scope_reasons, *extraction.incomplete_reasons]
+        if not extraction.batches.complete:
             incomplete_reasons.append(
-                f"Индивидуальный аудит завершён для {len(indiv.individual_requirements.completed)} "
-                f"из {len(indiv.individual_requirements.planned)} требований."
+                f"Завершено пакетов извлечения: {len(extraction.batches.completed)} из {len(extraction.batches.planned)}."
             )
-        if not indiv.audit_batches.complete:
-            incomplete_reasons.append(
-                f"Завершено пакетов индивидуального аудита: {len(indiv.audit_batches.completed)} "
-                f"из {len(indiv.audit_batches.planned)}."
+
+        logger.info(
+            "run=%s stage=extract dt=%.2fs reqs=%d blocks=%d/%d attempts=%d",
+            active_run_id,
+            time.monotonic() - t_stage,
+            len(extraction.requirements),
+            len(extraction_blocks.completed),
+            len(extraction_blocks.planned),
+            extraction.attempts,
+        )
+        if extraction_blocks.completed:
+            _safe_emit(
+                PipelineStage.EXTRACT,
+                "completed",
+                f"Извлечено требований: {len(extraction.requirements)} "
+                f"(обработано блоков {len(extraction_blocks.completed)}/{len(extraction_blocks.planned)}).",
             )
-        _emit(
-            on_progress,
-            PipelineStage.INDIVIDUAL,
-            "completed" if indiv.individual_requirements.completed else "failed",
-            f"Индивидуальный аудит: {len(indiv.individual_requirements.completed)}/"
-            f"{len(indiv.individual_requirements.planned)} требований, кандидатов находок: {len(indiv.findings)}.",
-        )
-
-        # Stage 4: Holistic set-level audit (5 ISO 29148 + 8 IEEE 830 criteria).
-        _emit(
-            on_progress,
-            PipelineStage.HOLISTIC,
-            "started",
-            f"Целостный аудит набора из {len(requirements)} требований (ISO 29148 / IEEE 830).",
-        )
-        holistic = audit_holistic_set(
-            requirements,
-            document,
-            settings,
-            inspected_blocks=completed_block_set,
-            budget=active_budget,
-            generate_fn=generate_fn,
-            ground_fn=ground_fn,
-            max_requirements_per_group=max_requirements_per_group,
-        )
-        incomplete_reasons.extend(holistic.incomplete_reasons)
-        if not holistic.cross_section_groups.complete:
-            incomplete_reasons.append(
-                f"Завершено групп целостного аудита: {len(holistic.cross_section_groups.completed)} "
-                f"из {len(holistic.cross_section_groups.planned)}."
+        else:
+            _safe_emit(
+                PipelineStage.EXTRACT,
+                "failed",
+                "Этап извлечения не завершил ни одного блока.",
             )
-        _emit(
-            on_progress,
-            PipelineStage.HOLISTIC,
-            "completed" if holistic.cross_section_groups.completed else "failed",
-            f"Целостный аудит: групп {len(holistic.cross_section_groups.completed)}/"
-            f"{len(holistic.cross_section_groups.planned)}, кандидатов находок: {len(holistic.findings)}.",
-        )
 
-        # Combine and deduplicate findings across individual + holistic stages before verification.
-        ind_findings, ind_evals = _prefix_stage_outputs("IND", indiv.findings, indiv.evaluations)
-        hol_findings, hol_evals = _prefix_stage_outputs("HOL", holistic.findings, holistic.evaluations)
-        dedup_findings, id_map = deduplicate_findings(
-            [*ind_findings, *hol_findings],
-            finding_id_start=1,
-            block_order=block_order,
-        )
-        combined_evals = _remap_evaluations([*ind_evals, *hol_evals], id_map)
+        requirements = extraction.requirements
+        completed_block_set = set(extraction_blocks.completed)
 
-        # Stage 5: Independent semantic verification of MAJOR/CRITICAL candidates.
-        to_verify_count = sum(
-            1
-            for f in dedup_findings
-            if f.severity in (Severity.CRITICAL, Severity.MAJOR)
-            and f.semantic_status == SemanticStatus.UNCHECKED
-        )
-        _emit(
-            on_progress,
-            PipelineStage.VERIFY,
-            "started",
-            f"Семантическая проверка серьёзных кандидатов: {to_verify_count}.",
-        )
-        verification = verify_findings(
-            dedup_findings,
-            document,
-            settings,
-            evaluations=combined_evals,
-            inspected_blocks=completed_block_set,
-            budget=active_budget,
-            generate_fn=generate_fn,
-            batch_size=verification_batch_size,
-        )
-        incomplete_reasons.extend(verification.incomplete_reasons)
-        final_findings = verification.findings
-        final_evaluations = reconcile_evaluations_with_findings(
-            verification.evaluations,
-            final_findings,
-        )
-        _emit(
-            on_progress,
-            PipelineStage.VERIFY,
-            "completed" if not verification.incomplete_reasons else "failed",
-            f"Подтверждено находок: {sum(f.confirmed for f in final_findings)} из {len(final_findings)}.",
-        )
+        indiv: IndividualAuditResult | None = None
+        holistic: HolisticAuditResult | None = None
+        verification: VerificationResult | None = None
+        clarification: QuestionGenerationResult | None = None
 
-        # Stage 6: Stakeholder clarification question engine.
-        _emit(
-            on_progress,
-            PipelineStage.CLARIFY,
-            "started",
-            "Формирование адресных вопросов для уточнения требований.",
-        )
-        clarification = generate_questions(
-            final_findings,
-            document,
-            settings,
-            budget=active_budget,
-            generate_fn=generate_fn,
-            batch_size=question_batch_size,
-        )
-        incomplete_reasons.extend(clarification.incomplete_reasons)
-        final_questions = clarification.questions
-        _emit(
-            on_progress,
-            PipelineStage.CLARIFY,
-            "completed" if not clarification.incomplete_reasons else "failed",
-            f"Сформировано уточняющих вопросов: {len(final_questions)}.",
-        )
+        final_findings: list[Finding] = []
+        final_evaluations: list[CriterionEvaluation] = []
+        final_questions: list[Question] = []
 
-        individual_requirements = indiv.individual_requirements
-        audit_batches = WorkSet(
-            planned=[*extraction.batches.planned, *indiv.audit_batches.planned],
-            completed=[*extraction.batches.completed, *indiv.audit_batches.completed],
-        )
-        cross_section_groups = holistic.cross_section_groups
+        if not requirements:
+            incomplete_reasons.append("Не извлечено ни одного требования для проведения аудита.")
+            individual_requirements = WorkSet(planned=[], completed=[])
+            audit_batches = extraction.batches
+            cross_section_groups = WorkSet(planned=[], completed=[])
+        else:
+            def _run_individual() -> IndividualAuditResult:
+                t0 = time.monotonic()
+                _safe_emit(
+                    PipelineStage.INDIVIDUAL,
+                    "started",
+                    f"Индивидуальный аудит {len(requirements)} требований по 9 критериям ISO 29148.",
+                )
+                res = audit_individual_requirements(
+                    requirements,
+                    document,
+                    settings,
+                    inspected_blocks=completed_block_set,
+                    budget=active_budget,
+                    generate_fn=generate_fn,
+                    ground_fn=ground_fn,
+                    max_input_tokens=max_input_tokens,
+                    max_output_tokens=max_output_tokens,
+                    max_requirements_per_batch=max_requirements_per_batch,
+                    max_concurrency=max(1, effective_concurrency - 1) if effective_concurrency > 1 else 1,
+                )
+                logger.info(
+                    "run=%s stage=individual dt=%.2fs reqs=%d/%d findings=%d attempts=%d",
+                    active_run_id,
+                    time.monotonic() - t0,
+                    len(res.individual_requirements.completed),
+                    len(res.individual_requirements.planned),
+                    len(res.findings),
+                    res.attempts,
+                )
+                _safe_emit(
+                    PipelineStage.INDIVIDUAL,
+                    "completed" if res.individual_requirements.completed else "failed",
+                    f"Индивидуальный аудит: {len(res.individual_requirements.completed)}/"
+                    f"{len(res.individual_requirements.planned)} требований, кандидатов находок: {len(res.findings)}.",
+                )
+                return res
+
+            def _run_holistic() -> HolisticAuditResult:
+                t0 = time.monotonic()
+                _safe_emit(
+                    PipelineStage.HOLISTIC,
+                    "started",
+                    f"Целостный аудит набора из {len(requirements)} требований (ISO 29148 / IEEE 830).",
+                )
+                res = audit_holistic_set(
+                    requirements,
+                    document,
+                    settings,
+                    inspected_blocks=completed_block_set,
+                    structural_signals=structural_signals,
+                    budget=active_budget,
+                    generate_fn=generate_fn,
+                    ground_fn=ground_fn,
+                    max_requirements_per_group=max_requirements_per_group,
+                    max_concurrency=1,
+                )
+                logger.info(
+                    "run=%s stage=holistic dt=%.2fs groups=%d/%d findings=%d attempts=%d",
+                    active_run_id,
+                    time.monotonic() - t0,
+                    len(res.cross_section_groups.completed),
+                    len(res.cross_section_groups.planned),
+                    len(res.findings),
+                    res.attempts,
+                )
+                _safe_emit(
+                    PipelineStage.HOLISTIC,
+                    "completed" if res.cross_section_groups.completed else "failed",
+                    f"Целостный аудит: групп {len(res.cross_section_groups.completed)}/"
+                    f"{len(res.cross_section_groups.planned)}, кандидатов находок: {len(res.findings)}.",
+                )
+                return res
+
+            # Stages 3 & 4 have zero data dependency on each other once requirements are extracted.
+            if effective_concurrency > 1:
+                with ThreadPoolExecutor(max_workers=2) as stage_pool:
+                    indiv_fut = stage_pool.submit(_run_individual)
+                    holistic_fut = stage_pool.submit(_run_holistic)
+                    indiv = indiv_fut.result()
+                    holistic = holistic_fut.result()
+            else:
+                indiv = _run_individual()
+                holistic = _run_holistic()
+
+            incomplete_reasons.extend(indiv.incomplete_reasons)
+            if not indiv.individual_requirements.complete:
+                incomplete_reasons.append(
+                    f"Индивидуальный аудит завершён для {len(indiv.individual_requirements.completed)} "
+                    f"из {len(indiv.individual_requirements.planned)} требований."
+                )
+            if not indiv.audit_batches.complete:
+                incomplete_reasons.append(
+                    f"Завершено пакетов индивидуального аудита: {len(indiv.audit_batches.completed)} "
+                    f"из {len(indiv.audit_batches.planned)}."
+                )
+            incomplete_reasons.extend(holistic.incomplete_reasons)
+            if not holistic.cross_section_groups.complete:
+                incomplete_reasons.append(
+                    f"Завершено групп целостного аудита: {len(holistic.cross_section_groups.completed)} "
+                    f"из {len(holistic.cross_section_groups.planned)}."
+                )
+
+            # Combine and deduplicate findings across individual + holistic stages before verification.
+            ind_findings, ind_evals = _prefix_stage_outputs("IND", indiv.findings, indiv.evaluations)
+            hol_findings, hol_evals = _prefix_stage_outputs("HOL", holistic.findings, holistic.evaluations)
+            dedup_findings, id_map = deduplicate_findings(
+                [*ind_findings, *hol_findings],
+                finding_id_start=1,
+                block_order=block_order,
+            )
+            combined_evals = _remap_evaluations([*ind_evals, *hol_evals], id_map)
+
+            # Stage 5: Independent semantic verification of MAJOR/CRITICAL candidates.
+            t_verify = time.monotonic()
+            to_verify_count = sum(
+                1
+                for f in dedup_findings
+                if f.severity in (Severity.CRITICAL, Severity.MAJOR)
+                and f.semantic_status == SemanticStatus.UNCHECKED
+            )
+            _safe_emit(
+                PipelineStage.VERIFY,
+                "started",
+                f"Семантическая проверка серьёзных кандидатов: {to_verify_count}.",
+            )
+            verification = verify_findings(
+                dedup_findings,
+                document,
+                settings,
+                evaluations=combined_evals,
+                inspected_blocks=completed_block_set,
+                budget=active_budget,
+                generate_fn=generate_fn,
+                batch_size=verification_batch_size,
+                max_concurrency=effective_concurrency,
+            )
+            incomplete_reasons.extend(verification.incomplete_reasons)
+            final_findings = verification.findings
+            final_evaluations = reconcile_evaluations_with_findings(
+                verification.evaluations,
+                final_findings,
+            )
+            logger.info(
+                "run=%s stage=verify dt=%.2fs checked=%d confirmed=%d attempts=%d",
+                active_run_id,
+                time.monotonic() - t_verify,
+                to_verify_count,
+                sum(f.confirmed for f in final_findings),
+                verification.attempts,
+            )
+            _safe_emit(
+                PipelineStage.VERIFY,
+                "completed" if not verification.incomplete_reasons else "failed",
+                f"Подтверждено находок: {sum(f.confirmed for f in final_findings)} из {len(final_findings)}.",
+            )
+
+            # Stage 6: Stakeholder clarification question engine.
+            t_clarify = time.monotonic()
+            _safe_emit(
+                PipelineStage.CLARIFY,
+                "started",
+                "Формирование адресных вопросов для уточнения требований.",
+            )
+            clarification = generate_questions(
+                final_findings,
+                document,
+                settings,
+                budget=active_budget,
+                generate_fn=generate_fn,
+                batch_size=question_batch_size,
+                max_concurrency=effective_concurrency,
+            )
+            incomplete_reasons.extend(clarification.incomplete_reasons)
+            final_questions = clarification.questions
+            logger.info(
+                "run=%s stage=clarify dt=%.2fs questions=%d attempts=%d",
+                active_run_id,
+                time.monotonic() - t_clarify,
+                len(final_questions),
+                clarification.attempts,
+            )
+            _safe_emit(
+                PipelineStage.CLARIFY,
+                "completed" if not clarification.incomplete_reasons else "failed",
+                f"Сформировано уточняющих вопросов: {len(final_questions)}.",
+            )
+
+            individual_requirements = indiv.individual_requirements
+            audit_batches = WorkSet(
+                planned=[*extraction.batches.planned, *indiv.audit_batches.planned],
+                completed=[*extraction.batches.completed, *indiv.audit_batches.completed],
+            )
+            cross_section_groups = holistic.cross_section_groups
 
     # Stage 7: Coverage reconciliation, deterministic readiness decision, and canonical report.
-    _emit(
-        on_progress,
+    _safe_emit(
         PipelineStage.REPORT,
         "started",
         "Сверка покрытия, расчёт вердикта готовности и сборка канонического отчёта.",
@@ -667,6 +751,7 @@ def execute_pipeline(
     )
     material_uncertainties = _collect_material_uncertainties(
         final_findings,
+        indiv,
         holistic,
         clarification,
     )
@@ -693,8 +778,7 @@ def execute_pipeline(
         output_tokens=total_out,
         decide_fn=decide_fn,
     )
-    _emit(
-        on_progress,
+    _safe_emit(
         PipelineStage.REPORT,
         "completed",
         f"Отчёт готов: статус={report.coverage.execution.value}, "
@@ -702,11 +786,13 @@ def execute_pipeline(
         f"нарушений={report.statistics.violations}, вопросов={report.statistics.questions}.",
     )
     logger.info(
-        "run=%s stage=done execution=%s readiness=%s attempts=%d duration=%.3fs",
+        "run=%s stage=done execution=%s readiness=%s attempts=%d duration=%.3fs rate_wait=%.2fs retry_wait=%.2fs",
         active_run_id,
         report.coverage.execution.value,
         report.verdict.readiness.value,
         report.metadata.request_attempts,
         report.metadata.duration_seconds,
+        active_budget.rate_limit_wait_seconds,
+        active_budget.retry_wait_seconds,
     )
     return report

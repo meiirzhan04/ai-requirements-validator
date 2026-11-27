@@ -113,8 +113,8 @@ def _borrow_client(secret: str, http: types.HttpOptions):
 
 
 _THINKING_BUDGET_BY_STAGE: dict[PipelineStage, int] = {
-    PipelineStage.HOLISTIC: 4096,
-    PipelineStage.VERIFY: 2048,
+    PipelineStage.HOLISTIC: 6144,
+    PipelineStage.VERIFY: 3072,
 }
 
 

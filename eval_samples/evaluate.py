@@ -36,8 +36,13 @@ def score(report, truth, review=None):
     blocks = {b.block_id: b.text for b in report.document.version.blocks}
     references = [ref for f in confirmed.values()
                   for ref in [*f.evidence, *([f.gap.context] if f.gap else [])]]
-    correct = sum(ref.version == meta.document_version and ref.grounded
-                  and blocks[ref.block_id][ref.start:ref.end] == ref.quote for ref in references)
+    correct = sum(
+        ref.version == meta.document_version
+        and ref.grounded
+        and (block_text := blocks.get(ref.block_id)) is not None
+        and block_text[ref.start:ref.end] == ref.quote
+        for ref in references
+    )
     coverage = report.coverage
     results = {
         "run": meta.model_dump(mode="json"), "execution": coverage.execution,
@@ -84,7 +89,22 @@ def score(report, truth, review=None):
     return results
 
 
-def evaluate(source, report_file, review_file=None):
+def build_review_template(report: ValidationReport, truth: dict) -> dict:
+    """Build an unannotated, schema-valid Review skeleton for two human reviewers."""
+    confirmed = [f for f in report.findings if f.confirmed]
+    template = Review(
+        run_id=report.metadata.run_id,
+        document_sha256=report.metadata.document_version,
+        requirements={r.req_id: [] for r in report.requirements},
+        findings={f.finding_id: None for f in confirmed},
+        false_alarms={key: [] for key in truth["valid"]},
+        questions={q.question_id: (False, False, False, False) for q in report.questions},
+        reviewers=[],
+    )
+    return template.model_dump(mode="json")
+
+
+def _load_verified_case(source: Path, report_file: Path) -> tuple[str, ValidationReport, dict]:
     report = ValidationReport.model_validate_json(report_file.read_bytes())
     data = source.read_bytes()
     case = source.stem
@@ -108,8 +128,13 @@ def evaluate(source, report_file, review_file=None):
         raise ValueError("Input differs from annotated case")
     if parse(report.document.version.name, data) != report.document:
         raise ValueError("Recorded source blocks differ from original input")
+    return case, report, truth[case]
+
+
+def evaluate(source, report_file, review_file=None):
+    case, report, case_truth = _load_verified_case(source, report_file)
     review = Review.model_validate_json(review_file.read_bytes()) if review_file else None
-    return {"case": case, "format": report.document.version.format, **score(report, truth[case], review)}
+    return {"case": case, "format": report.document.version.format, **score(report, case_truth, review)}
 
 
 if __name__ == "__main__":
@@ -117,5 +142,14 @@ if __name__ == "__main__":
     parser.add_argument("input", type=Path)
     parser.add_argument("report", type=Path)
     parser.add_argument("--review", type=Path)
+    parser.add_argument(
+        "--init-review",
+        action="store_true",
+        help="Print an unannotated Review JSON template for human adjudication",
+    )
     args = parser.parse_args()
-    print(json.dumps(evaluate(args.input, args.report, args.review), ensure_ascii=False, indent=2))
+    if args.init_review:
+        _, verified_report, verified_truth = _load_verified_case(args.input, args.report)
+        print(json.dumps(build_review_template(verified_report, verified_truth), ensure_ascii=False, indent=2))
+    else:
+        print(json.dumps(evaluate(args.input, args.report, args.review), ensure_ascii=False, indent=2))

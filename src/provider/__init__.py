@@ -1,7 +1,10 @@
 """Single Gemini transport entry point for pipeline and clarification stages."""
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+from contextvars import ContextVar
+from dataclasses import dataclass, field
 from functools import lru_cache
+import logging
 import threading
 from typing import Any, TypeVar
 
@@ -23,9 +26,29 @@ from .settings import load_settings
 
 Output = TypeVar("Output", bound=BaseModel)
 
-_REAL_GENAI_CLIENT = genai.Client
-_SESSION_LOCK = threading.RLock()
-_ACTIVE_SESSIONS: list[tuple[str, Any]] = []
+
+_PRIVATE_REQUEST = ContextVar("private_gemini_request", default=False)
+
+
+def _allow_transport_log(record: logging.LogRecord) -> bool:
+    return not _PRIVATE_REQUEST.get()
+
+
+# Transport diagnostics can include complete URLs, response headers and SDK payloads.
+for _logger_name in ("httpx", "httpx2", "httpcore.connection", "httpcore.http11", "httpcore.http2",
+                     "httpcore.proxy", "httpcore.socks", "google_genai._api_client", "google_genai.models"):
+    logging.getLogger(_logger_name).addFilter(_allow_transport_log)
+
+
+@dataclass(eq=False)
+class _Session:
+    secret: str = field(repr=False)
+    client: Any = field(repr=False)
+    borrowers: int = 0
+
+
+_SESSION_LOCK = threading.Condition()
+_ACTIVE_SESSIONS: list[_Session] = []
 
 __all__ = [
     "FailureAction",
@@ -46,40 +69,52 @@ def _cached_json_schema(model_cls: type[BaseModel]) -> dict[str, Any]:
 @contextmanager
 def provider_session(settings: ProviderSettings) -> Iterator[None]:
     """Reuse one thread-safe google-genai Client across a pipeline run for HTTP keep-alive pooling."""
-    if not settings.api_key or genai.Client is not _REAL_GENAI_CLIENT:
+    if not settings.api_key:
         yield
         return
     secret = settings.api_key.get_secret_value()
-    http = types.HttpOptions(
-        timeout=settings.timeout_ms,
-        retry_options=types.HttpRetryOptions(attempts=1),
-    )
-    entry: tuple[str, Any] | None = None
-    with genai.Client(api_key=secret, http_options=http) as client:
-        entry = (secret, client)
+    http = types.HttpOptions(timeout=settings.timeout_ms, retry_options=types.HttpRetryOptions(attempts=1))
+    with ExitStack() as stack:
+        try:
+            client = stack.enter_context(genai.Client(api_key=secret, http_options=http))
+        except Exception:
+            raise ProviderError("Provider session initialization failed") from None
+        entry = _Session(secret, client)
         with _SESSION_LOCK:
             _ACTIVE_SESSIONS.append(entry)
         try:
             yield
         finally:
             with _SESSION_LOCK:
-                if entry in _ACTIVE_SESSIONS:
-                    _ACTIVE_SESSIONS.remove(entry)
+                _ACTIVE_SESSIONS.remove(entry)
+                _SESSION_LOCK.wait_for(lambda: entry.borrowers == 0)
+            try:
+                stack.close()
+            except Exception:
+                raise ProviderError("Provider session close failed") from None
 
 
-def _lookup_session_client(secret: str) -> Any | None:
-    if genai.Client is not _REAL_GENAI_CLIENT:
-        return None
+@contextmanager
+def _borrow_client(secret: str, http: types.HttpOptions):
     with _SESSION_LOCK:
-        for entry_secret, client in reversed(_ACTIVE_SESSIONS):
-            if entry_secret == secret:
-                return client
-    return None
+        entry = next((item for item in reversed(_ACTIVE_SESSIONS) if item.secret == secret), None)
+        if entry:
+            entry.borrowers += 1
+    if entry is None:
+        with genai.Client(api_key=secret, http_options=http) as client:
+            yield client
+        return
+    try:
+        yield entry.client
+    finally:
+        with _SESSION_LOCK:
+            entry.borrowers -= 1
+            _SESSION_LOCK.notify_all()
 
 
 _THINKING_BUDGET_BY_STAGE: dict[PipelineStage, int] = {
-    PipelineStage.HOLISTIC: 4096,
-    PipelineStage.VERIFY: 2048,
+    PipelineStage.HOLISTIC: 6144,
+    PipelineStage.VERIFY: 3072,
 }
 
 
@@ -138,15 +173,7 @@ def generate(
             call_attempts=call_attempts,
             estimated_tokens=estimated_tokens,
         )
-        timeout_ms = active_budget.effective_timeout_ms(
-            settings.timeout_ms,
-            call_attempts=call_attempts,
-        )
         call_attempts += 1
-        http = types.HttpOptions(
-            timeout=timeout_ms,
-            retry_options=types.HttpRetryOptions(attempts=1),
-        )
         config_kwargs: dict[str, Any] = {
             "response_mime_type": "application/json",
             "response_json_schema": schema,
@@ -159,73 +186,74 @@ def generate(
         if system_instruction is not None:
             config_kwargs["system_instruction"] = system_instruction
 
+        privacy_token = _PRIVATE_REQUEST.set(True)
         try:
-            shared_client = _lookup_session_client(secret)
-            if shared_client is not None:
+            http = types.HttpOptions(
+                timeout=active_budget.effective_timeout_ms(settings.timeout_ms, call_attempts=call_attempts),
+                retry_options=types.HttpRetryOptions(attempts=1),
+            )
+            with _borrow_client(secret, http) as client:
+                http.timeout = active_budget.effective_timeout_ms(settings.timeout_ms, call_attempts=call_attempts)
                 config_kwargs["http_options"] = http
-                response = shared_client.models.generate_content(
-                    model=settings.model,
-                    contents=serialized_payload,
-                    config=types.GenerateContentConfig(**config_kwargs),
-                )
-            else:
-                with genai.Client(api_key=secret, http_options=http) as client:
+                config = types.GenerateContentConfig(**config_kwargs)
+                with active_budget.measure_api_call():
                     response = client.models.generate_content(
-                        model=settings.model,
-                        contents=serialized_payload,
-                        config=types.GenerateContentConfig(**config_kwargs),
+                        model=settings.model, contents=serialized_payload, config=config,
                     )
         except errors.APIError as exc:
-            active_budget.record_unknown_usage()
             err = classify_api_error(exc, attempts=call_attempts)
-            if err.retryable and call_attempts < allowed_attempts:
-                active_budget.wait_before_retry(
-                    attempt=call_attempts,
-                    server_delay=extract_retry_delay(exc),
-                )
-                continue
-            raise err from None
-        except ProviderError:
-            raise
+            server_delay = extract_retry_delay(exc) if err.retryable else None
+        except ProviderError as exc:
+            err = exc
+            server_delay = None
         except Exception as exc:
-            # SDK/transport exceptions can embed headers and request content.
-            active_budget.record_unknown_usage()
             err = classify_transport_error(exc, attempts=call_attempts)
-            if err.retryable and call_attempts < allowed_attempts:
-                active_budget.wait_before_retry(attempt=call_attempts)
-                continue
-            raise err from None
+            server_delay = None
+        else:
+            break
+        finally:
+            _PRIVATE_REQUEST.reset(privacy_token)
 
-        in_tokens, out_tokens = active_budget.record_usage(response.usage_metadata)
-        candidate = next(iter(response.candidates or []), None)
-        if not candidate or candidate.finish_reason != types.FinishReason.STOP:
-            if candidate and candidate.finish_reason == types.FinishReason.MAX_TOKENS:
-                raise ProviderError(
-                    "Truncated structured response (MAX_TOKENS)",
-                    reason=FailureReason.TRUNCATED,
-                    action=FailureAction.SPLIT,
-                    attempts=call_attempts,
-                )
+        active_budget.record_failure(err.reason)
+        active_budget.record_unknown_usage()
+        if err.retryable and call_attempts < allowed_attempts:
+            active_budget.wait_before_retry(attempt=call_attempts, server_delay=server_delay)
+            continue
+        raise err from None
+
+    in_tokens, out_tokens = active_budget.record_usage(response.usage_metadata)
+    candidate = next(iter(response.candidates or []), None)
+    if not candidate or candidate.finish_reason != types.FinishReason.STOP:
+        if candidate and candidate.finish_reason == types.FinishReason.MAX_TOKENS:
+            active_budget.record_failure(FailureReason.TRUNCATED)
             raise ProviderError(
-                "Blocked, empty or truncated response",
-                reason=FailureReason.BLOCKED_RESPONSE,
-                action=FailureAction.STOP,
+                "Truncated structured response (MAX_TOKENS)",
+                reason=FailureReason.TRUNCATED,
+                action=FailureAction.SPLIT,
                 attempts=call_attempts,
             )
-        try:
-            output = output_type.model_validate_json(response.text or "", strict=True)
-        except ValidationError:
-            raise ProviderError(
-                "Malformed structured response",
-                reason=FailureReason.MALFORMED_RESPONSE,
-                action=FailureAction.REPAIR,
-                attempts=call_attempts,
-            ) from None
-
-        return StageResult[output_type](
-            stage=stage,
-            output=output,
+        active_budget.record_failure(FailureReason.BLOCKED_RESPONSE)
+        raise ProviderError(
+            "Blocked, empty or truncated response",
+            reason=FailureReason.BLOCKED_RESPONSE,
+            action=FailureAction.STOP,
             attempts=call_attempts,
-            input_tokens=in_tokens,
-            output_tokens=out_tokens,
         )
+    try:
+        output = output_type.model_validate_json(response.text or "", strict=True)
+    except ValidationError:
+        active_budget.record_failure(FailureReason.MALFORMED_RESPONSE)
+        raise ProviderError(
+            "Malformed structured response",
+            reason=FailureReason.MALFORMED_RESPONSE,
+            action=FailureAction.REPAIR,
+            attempts=call_attempts,
+        ) from None
+
+    return StageResult[output_type](
+        stage=stage,
+        output=output,
+        attempts=call_attempts,
+        input_tokens=in_tokens,
+        output_tokens=out_tokens,
+    )

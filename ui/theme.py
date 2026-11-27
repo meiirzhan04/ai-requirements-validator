@@ -55,7 +55,7 @@ CSS = """
 }
 
 .block-container {
-    padding-top: 1.5rem;
+    padding-top: 2.65rem;
     padding-bottom: 3rem;
     max-width: 1240px;
 }
@@ -510,9 +510,40 @@ div[data-testid="stTabs"] [role="tab"] {
     overflow-x: clip;
 }
 
+/* Status Pills for Remediation Proposals */
+.rv-pill {
+    display: inline-block;
+    font-size: 0.72rem;
+    font-weight: 600;
+    padding: 0.14rem 0.48rem;
+    border-radius: 4px;
+    border: 1px solid var(--rv-border);
+    background: var(--rv-subtle-bg);
+    color: var(--rv-text);
+    white-space: nowrap;
+}
+
+.rv-pill--approved {
+    border-color: rgba(21, 128, 61, 0.38);
+    background: rgba(21, 128, 61, 0.09);
+    color: #15803D;
+}
+
+.rv-pill--rejected {
+    border-color: rgba(185, 28, 28, 0.35);
+    background: rgba(185, 28, 28, 0.08);
+    color: #B91C1C;
+}
+
+.rv-pill--warn {
+    border-color: rgba(180, 83, 9, 0.38);
+    background: rgba(180, 83, 9, 0.09);
+    color: #B45309;
+}
+
 @media (max-width: 768px) {
     .block-container {
-        padding-top: 1rem;
+        padding-top: 2rem;
         padding-left: 0.9rem;
         padding-right: 0.9rem;
     }

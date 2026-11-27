@@ -253,6 +253,12 @@ def apply_changes(
         diagnostics.append(f"В исходном PDF остались непрочитанные страницы: {pages}.")
 
     improved_document = ParsedDocument(version=child_version, diagnostics=diagnostics)
+    change_log_diagnostics = list(diagnostics)
+    if version.format == DocumentFormat.PDF:
+        change_log_diagnostics.append(
+            "Производный рабочий документ Markdown: исходный файл имел формат PDF; "
+            "исходная вёрстка PDF при экспорте Markdown не сохраняется."
+        )
 
     ordered_edits = sorted(
         normalized,
@@ -290,7 +296,7 @@ def apply_changes(
         improved_sha256=child_version.sha256,
         applied_count=len(entries),
         entries=entries,
-        diagnostics=diagnostics,
+        diagnostics=change_log_diagnostics,
     )
     return ImprovedDocumentBundle(
         document=improved_document,

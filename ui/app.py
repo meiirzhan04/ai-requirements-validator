@@ -28,7 +28,8 @@ saved = mode == "Сохранённый отчёт"
 report = dashboard.open_saved() if saved else dashboard.analyze()
 
 with header_slot.container():
-    active_step = 1 if report is None else (5 if report.questions else 6)
+    has_remediation = bool(report and (report.questions or any(f.confirmed for f in report.findings)))
+    active_step = 1 if report is None else (5 if has_remediation else 6)
     dashboard.render_header(active_step=active_step)
 
 if report is not None:

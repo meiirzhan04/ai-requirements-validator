@@ -1,6 +1,8 @@
 """Retry policy, unified quota/token accounting, and typed failure classification."""
 from collections import Counter, deque
 from collections.abc import Callable
+from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 from enum import StrEnum
 import math
 import random
@@ -9,12 +11,13 @@ import threading
 import time
 from typing import Any
 
+import httpx2
 from google.genai import errors
 
 from src.contracts import PipelineStage
 
 _DAILY_QUOTA_PATTERN = re.compile(
-    r"(?:per[_ ]?day|daily[_ ]?(?:quota|limit)|requestsperday|tokensperday|\brpd\b)",
+    r"(?:per[-_ /]?day|/d(?:ay)?\b|daily[-_ ]?request|daily[_ ]?(?:quota|limit)|requestsperday|tokensperday|\brpd\b)",
     re.IGNORECASE,
 )
 _DURATION_PATTERN = re.compile(r"^\s*(\d+(?:\.\d+)?)\s*(ms|s)?\s*$", re.IGNORECASE)
@@ -93,7 +96,7 @@ class QuotaBudget:
     ) -> None:
         if not 1 <= max_attempts_per_call <= 3:
             raise ValueError("max_attempts_per_call must be between 1 and 3")
-        if base_delay_seconds < 0 or max_delay_seconds < 0 or jitter_ratio < 0:
+        if any(not math.isfinite(v) or v < 0 for v in (base_delay_seconds, max_delay_seconds, jitter_ratio)):
             raise ValueError("Delay and jitter settings must be non-negative")
         self.max_attempts_per_call = max_attempts_per_call
         self.max_total_attempts = max_total_attempts
@@ -111,6 +114,15 @@ class QuotaBudget:
         self._started_at = clock()
         self._lock = threading.RLock()
 
+        self._cooldown_until = self._started_at
+        self._recovery_until = self._started_at
+        self._daily_exhausted = False
+        self._settled = threading.Condition(self._lock)
+        self._pending_tokens = 0
+        self._reservation = threading.local()
+        self.api_latency_seconds = 0.0
+        self.retry_attempts = 0
+        self.failures_by_reason: Counter[FailureReason] = Counter()
         self.attempts: int = 0
         self.input_tokens: int = 0
         self.output_tokens: int = 0
@@ -121,6 +133,37 @@ class QuotaBudget:
         self.attempts_by_stage: Counter[PipelineStage] = Counter()
         self._request_window: deque[float] = deque()
         self._token_window: deque[tuple[float, int]] = deque()
+
+    @contextmanager
+    def measure_api_call(self):
+        started = self._clock()
+        try:
+            yield
+        finally:
+            with self._lock:
+                self.api_latency_seconds += self._clock() - started
+
+    def record_failure(self, reason: FailureReason) -> None:
+        with self._lock:
+            self.failures_by_reason[reason] += 1
+            if reason == FailureReason.DAILY_QUOTA_EXHAUSTED:
+                self._daily_exhausted = True
+
+    def metrics_snapshot(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "attempts": self.attempts,
+                "attempts_by_stage": dict(self.attempts_by_stage),
+                "retry_attempts": self.retry_attempts,
+                "api_latency_seconds": self.api_latency_seconds,
+                "rate_limit_wait_seconds": self.rate_limit_wait_seconds,
+                "retry_wait_seconds": self.retry_wait_seconds,
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+                "known_usage_attempts": self.known_usage_attempts,
+                "unknown_usage_attempts": self.unknown_usage_attempts,
+                "failures_by_reason": dict(self.failures_by_reason),
+            }
 
     @property
     def total_tokens(self) -> int:
@@ -150,7 +193,7 @@ class QuotaBudget:
         remaining = self.remaining_seconds()
         if remaining is None:
             return default_timeout_ms
-        if remaining <= 0:
+        if remaining < 0.001:
             raise ProviderError(
                 "Elapsed time budget exhausted",
                 reason=FailureReason.BUDGET_EXHAUSTED,
@@ -184,15 +227,17 @@ class QuotaBudget:
                 action=FailureAction.STOP,
                 attempts=call_attempts,
             )
+        started = self._clock()
         self._sleep(delay)
+        waited = self._clock() - started
         with self._lock:
             if category == "retry":
-                self.retry_wait_seconds += delay
+                self.retry_wait_seconds += waited
             else:
-                self.rate_limit_wait_seconds += delay
+                self.rate_limit_wait_seconds += waited
 
     def _check_hard_limits_locked(self, *, call_attempts: int, estimated_tokens: int) -> None:
-        if self.rpd_limit is not None and self.attempts >= self.rpd_limit:
+        if self._daily_exhausted or (self.rpd_limit is not None and self.attempts >= self.rpd_limit):
             raise ProviderError(
                 "Daily request quota exhausted",
                 reason=FailureReason.DAILY_QUOTA_EXHAUSTED,
@@ -208,7 +253,7 @@ class QuotaBudget:
             )
         if self.max_total_tokens is not None:
             total = self.input_tokens + self.output_tokens
-            projected = total + max(0, estimated_tokens)
+            projected = total + self._pending_tokens + max(0, estimated_tokens)
             if total >= self.max_total_tokens or (
                 estimated_tokens > 0 and projected > self.max_total_tokens
             ):
@@ -219,7 +264,7 @@ class QuotaBudget:
                     attempts=call_attempts,
                 )
         remaining = self.remaining_seconds()
-        if remaining is not None and remaining <= 0:
+        if remaining is not None and remaining < 0.001:
             raise ProviderError(
                 "Elapsed time budget exhausted",
                 reason=FailureReason.BUDGET_EXHAUSTED,
@@ -251,19 +296,29 @@ class QuotaBudget:
                 )
                 now = self._clock()
                 self._prune_windows(now)
-                wait = 0.0
+                wait = self._cooldown_until - now
                 if self.rpm_limit is not None and len(self._request_window) >= self.rpm_limit:
                     wait = max(wait, (self._request_window[0] + 60.0) - now)
                 if self.tpm_limit is not None:
-                    window_tokens = sum(tokens for _, tokens in self._token_window)
+                    window_tokens = self._pending_tokens + sum(tokens for _, tokens in self._token_window)
                     over_limit = (
                         window_tokens >= self.tpm_limit
                         if needed_tokens == 0
                         else (window_tokens + needed_tokens) > self.tpm_limit
                     )
+                    if over_limit and self._pending_tokens and not self._token_window:
+                        remaining = self.remaining_seconds()
+                        self._settled.wait(timeout=remaining)
+                        self.rate_limit_wait_seconds += max(0.0, self._clock() - now)
+                        continue
                     if over_limit and self._token_window:
                         wait = max(wait, (self._token_window[0][0] + 60.0) - now)
                 if wait <= 0:
+                    if now < self._recovery_until:
+                        self._cooldown_until = now + min(self.base_delay_seconds, self.max_delay_seconds)
+                    self._pending_tokens += needed_tokens
+                    self._reservation.tokens = needed_tokens
+                    self.retry_attempts += int(call_attempts > 0)
                     self.attempts += 1
                     self.attempts_by_stage[stage] += 1
                     self._request_window.append(now)
@@ -277,12 +332,18 @@ class QuotaBudget:
                 category="rate",
             )
 
+    def _settle_locked(self) -> None:
+        self._pending_tokens -= getattr(self._reservation, "tokens", 0)
+        self._reservation.tokens = 0
+        self._settled.notify_all()
+
     def record_usage(self, usage_metadata: Any) -> tuple[int | None, int | None]:
         in_tokens = getattr(usage_metadata, "prompt_token_count", None) if usage_metadata is not None else None
         cand_tokens = getattr(usage_metadata, "candidates_token_count", None) if usage_metadata is not None else None
         thought_tokens = getattr(usage_metadata, "thoughts_token_count", None) if usage_metadata is not None else None
         out_tokens = (cand_tokens + (thought_tokens or 0)) if cand_tokens is not None else None
         with self._lock:
+            self._settle_locked()
             if in_tokens is not None:
                 self.input_tokens += in_tokens
             if out_tokens is not None:
@@ -300,11 +361,12 @@ class QuotaBudget:
 
     def record_unknown_usage(self) -> None:
         with self._lock:
+            self._settle_locked()
             self.unknown_usage_attempts += 1
 
     def wait_before_retry(self, *, attempt: int, server_delay: float | None = None) -> float:
         with self._lock:
-            if self.rpd_limit is not None and self.attempts >= self.rpd_limit:
+            if self._daily_exhausted or (self.rpd_limit is not None and self.attempts >= self.rpd_limit):
                 raise ProviderError(
                     "Daily request quota exhausted",
                     reason=FailureReason.DAILY_QUOTA_EXHAUSTED,
@@ -328,7 +390,10 @@ class QuotaBudget:
             backoff = min(self.max_delay_seconds, self.base_delay_seconds * (2 ** (attempt - 1)))
             base = max(backoff, server_delay) if server_delay is not None and server_delay > 0 else backoff
             sample = min(1.0, max(0.0, float(self._rand())))
-            delay = base + (base * self.jitter_ratio * sample)
+            delay = min(self.max_delay_seconds, base + (base * self.jitter_ratio * sample))
+            deadline = self._clock() + delay
+            self._cooldown_until = max(self._cooldown_until, deadline)
+            self._recovery_until = max(self._recovery_until, deadline + delay)
 
         self._sleep_within_budget(
             delay,
@@ -361,6 +426,13 @@ def extract_retry_delay(exc: errors.APIError) -> float | None:
         for key, value in headers.items():
             if str(key).lower() == "retry-after":
                 parsed = _parse_duration_seconds(value)
+                if parsed is None and isinstance(value, str):
+                    try:
+                        stamp = parsedate_to_datetime(value)
+                        if stamp.tzinfo is not None:
+                            parsed = max(0.0, stamp.timestamp() - time.time())
+                    except (ValueError, TypeError, OverflowError, OSError):
+                        pass
                 if parsed is not None:
                     candidates.append(parsed)
 
@@ -381,39 +453,17 @@ def extract_retry_delay(exc: errors.APIError) -> float | None:
 def _is_daily_quota_error(exc: errors.APIError) -> bool:
     if exc.code != 429:
         return False
-    texts: list[str] = []
-    if isinstance(exc.message, str):
-        texts.append(exc.message)
-    details = getattr(exc, "details", None)
-    if isinstance(details, dict):
-        error_obj = details.get("error") if isinstance(details.get("error"), dict) else details
-        if isinstance(error_obj, dict):
-            msg = error_obj.get("message")
-            if isinstance(msg, str):
-                texts.append(msg)
-            detail_items = error_obj.get("details")
-            if isinstance(detail_items, list):
-                for item in detail_items:
-                    if not isinstance(item, dict):
-                        continue
-                    for key in ("quotaId", "quotaMetric", "description", "reason"):
-                        val = item.get(key)
-                        if isinstance(val, str):
-                            texts.append(val)
-                    violations = item.get("violations")
-                    if isinstance(violations, list):
-                        for violation in violations:
-                            if isinstance(violation, dict):
-                                for key in ("quotaId", "quotaMetric", "description"):
-                                    val = violation.get(key)
-                                    if isinstance(val, str):
-                                        texts.append(val)
-    return any(_DAILY_QUOTA_PATTERN.search(text) for text in texts)
+    # ErrorInfo metadata and QuotaFailure violations can carry the limit at different depths.
+    return bool(_DAILY_QUOTA_PATTERN.search(str(exc.details)) or
+                _DAILY_QUOTA_PATTERN.search(exc.message or ""))
 
 
 def classify_api_error(exc: errors.APIError, *, attempts: int) -> ProviderError:
     code = exc.code
     if code == 400:
+        if re.search(r"api[_ ]key[_ ](?:not valid|invalid|expired)|invalid api key", str(exc.details), re.I):
+            return ProviderError("Invalid API key (HTTP 400)", reason=FailureReason.AUTH_ERROR,
+                                 status_code=400, attempts=attempts)
         return ProviderError(
             "Invalid request, schema or API key (HTTP 400)",
             reason=FailureReason.INVALID_REQUEST,
@@ -495,16 +545,16 @@ def _is_timeout_exception(exc: BaseException) -> bool:
 def classify_transport_error(exc: Exception, *, attempts: int) -> ProviderError:
     if _is_timeout_exception(exc):
         return ProviderError(
-            f"Transport timeout ({type(exc).__name__})",
+            "Transport timeout",
             reason=FailureReason.TIMEOUT,
             action=FailureAction.STOP,
             attempts=attempts,
             retryable=True,
         )
     return ProviderError(
-        f"Transport or SDK failure ({type(exc).__name__})",
+        "Transport or SDK failure",
         reason=FailureReason.TRANSPORT_ERROR,
         action=FailureAction.STOP,
         attempts=attempts,
-        retryable=False,
+        retryable=isinstance(exc, (ConnectionError, httpx2.NetworkError, httpx2.RemoteProtocolError)),
     )

@@ -11,9 +11,16 @@ from src.provider.dto import ProbeRequest, ProbeResponse
 
 
 def main() -> int:
-    settings = load_settings()
+    try:
+        settings = load_settings()
+    except (ValueError, OSError):
+        print("FAIL - invalid provider settings")
+        return 1
+    model = settings.model
+    if settings.api_key and settings.api_key.get_secret_value() in model:
+        model = "[redacted]"
     if not settings.api_key:
-        print(f"SKIPPED — model={settings.model} — API key required")
+        print(f"SKIPPED — model={model} — API key required")
         return 0
     try:
         probe = generate(PipelineStage.SMOKE, ProbeRequest(), ProbeResponse, settings=settings)
@@ -24,10 +31,10 @@ def main() -> int:
                 attempts=probe.attempts,
             )
     except ProviderError as exc:
-        print(f"FAIL — model={settings.model} — {exc}")
+        print(f"FAIL — model={model} — {exc.reason.value}")
         return 1
     print(
-        f"PASS — model={settings.model} value={probe.output.value} "
+        f"PASS — model={model} value={probe.output.value} "
         f"attempts={probe.attempts} input_tokens={probe.input_tokens} output_tokens={probe.output_tokens}"
     )
     return 0

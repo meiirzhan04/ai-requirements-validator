@@ -27,6 +27,7 @@ from src.pipeline.holistic import (
     deduplicate_findings,
 )
 from src.pipeline.verification import verify_findings
+from src.provider import FailureAction, FailureReason, ProviderError
 from src.provider.dto import (
     HolisticAuditOutput,
     HolisticCriterionCandidate,
@@ -426,3 +427,175 @@ def test_deduplication_merges_overlapping_criteria_and_preserves_single_id():
     assert set(merged[0].requirement_ids) == {"R001", "R002"}
     assert set(merged[0].criteria) == {QualityCriterion.SET_CONSISTENT, QualityCriterion.SRS_CONSISTENT}
     assert id_map == {"TMP-1": "F001", "TMP-2": "F001"}
+
+
+def test_holistic_syncs_criteria_drops_orphans_splits_on_truncation_and_bounds_multigroup_gaps():
+    blocks = [
+        ("B001", "Раздел 1 — API", "POST /api/v1/payments возвращает HTTP 201 и комиссию 1%."),
+        *[(f"B{i:03d}", f"Раздел {i}", f"Промежуточное правило учёта номер {i} для тарифа.") for i in range(2, 10)],
+        ("B010", "Раздел 10 — Приёмка", "POST /api/v1/payments возвращает HTTP 200 без описания таймаута."),
+    ]
+    doc, reqs = _build_spec_doc(blocks)
+
+    calls = 0
+
+    def fake_holistic(stage, payload: HolisticGroupPayload, output_type, *, settings=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1 and len(payload.requirements) > 1:
+            raise ProviderError(
+                "Truncated structured response (MAX_TOKENS)",
+                reason=FailureReason.TRUNCATED,
+                action=FailureAction.SPLIT,
+                attempts=1,
+            )
+        if "B010" in payload.inspected_block_ids:
+            # B010 is in a partial sub-group (not all 10 blocks inspected) -> gap must be scoped & UNCERTAIN!
+            # Also emit an orphan finding (ORPHAN) and extra un-failed criterion -> must be trimmed!
+            assert payload.has_uninspected_scope is True
+            return StageResult[HolisticAuditOutput](
+                stage=PipelineStage.HOLISTIC,
+                output=HolisticAuditOutput(
+                    evaluations=_all_13_whole_evals(
+                        {
+                            QualityCriterion.SET_COMPLETE: (
+                                CriterionStatus.FAIL,
+                                "Не указано поведение при таймауте.",
+                                ["G1"],
+                            )
+                        }
+                    ),
+                    findings=[
+                        HolisticFindingCandidate(
+                            local_key="G1",
+                            kind=FindingType.MISSING_INFORMATION,
+                            severity=Severity.MAJOR,
+                            claim="Отсутствует описание таймаута платежа.",
+                            recommendation="Указать таймаут.",
+                            requirement_ids=["R010"],
+                            criteria=[QualityCriterion.SET_COMPLETE, QualityCriterion.SRS_COMPLETE],
+                            expected_information="Таймаут вызова платёжного шлюза",
+                            gap_context=HolisticEvidenceQuote(block_id="B010", quote="без описания таймаута"),
+                            inspected_blocks=["B001", "B010"],  # B001 not in this sub-group's passages!
+                        ),
+                        HolisticFindingCandidate(
+                            local_key="ORPHAN",
+                            kind=FindingType.AMBIGUITY,
+                            severity=Severity.MINOR,
+                            claim="Несвязанная находка.",
+                            recommendation="Нет.",
+                            requirement_ids=["R010"],
+                            criteria=[QualityCriterion.SRS_UNAMBIGUOUS],
+                            evidence=[HolisticEvidenceQuote(block_id="B010", quote="HTTP 200")],
+                        ),
+                    ],
+                ),
+                attempts=1,
+            )
+        return StageResult[HolisticAuditOutput](
+            stage=PipelineStage.HOLISTIC,
+            output=HolisticAuditOutput(evaluations=_all_13_whole_evals()),
+            attempts=1,
+        )
+
+    holistic = audit_holistic_set(
+        reqs,
+        doc,
+        ProviderSettings(api_key="test"),
+        generate_fn=fake_holistic,
+        ground_fn=_exact_ground,
+        max_requirements_per_group=5,
+    )
+
+    assert holistic.cross_section_groups.complete
+    assert len(holistic.findings) == 1
+    gap_finding = holistic.findings[0]
+    assert gap_finding.criteria == [QualityCriterion.SET_COMPLETE]
+    assert gap_finding.semantic_status == SemanticStatus.UNCERTAIN
+    assert gap_finding.gap is not None
+    assert "B010" in gap_finding.gap.inspected_blocks
+    assert any("не привязана" in u for u in holistic.uncertainties)
+
+
+def test_verification_splits_on_truncation_and_keeps_failed_candidate_unchecked():
+    doc, reqs = _build_spec_doc(
+        [
+            ("B001", "API", "POST /api/v1/a возвращает HTTP 201."),
+            ("B002", "Приёмка", "POST /api/v1/a возвращает HTTP 200."),
+        ]
+    )
+    f1 = Finding(
+        finding_id="F001",
+        kind=FindingType.CONTRADICTION,
+        severity=Severity.CRITICAL,
+        claim="Конфликт кодов 201 и 200.",
+        recommendation="Согласовать код.",
+        requirement_ids=["R001", "R002"],
+        criteria=[QualityCriterion.SET_CONSISTENT],
+        evidence=[
+            EvidenceRef(version=SHA, block_id="B001", start=0, end=len(doc.version.blocks[0].text), quote=doc.version.blocks[0].text, grounding=GroundingStatus.EXACT),
+            EvidenceRef(version=SHA, block_id="B002", start=0, end=len(doc.version.blocks[1].text), quote=doc.version.blocks[1].text, grounding=GroundingStatus.EXACT),
+        ],
+        semantic_status=SemanticStatus.UNCHECKED,
+        verification_reason="Ожидает проверки.",
+    )
+    f2 = Finding(
+        finding_id="F002",
+        kind=FindingType.AMBIGUITY,
+        severity=Severity.MAJOR,
+        claim="Неясный формат ошибки.",
+        recommendation="Задать JSON-схему.",
+        requirement_ids=["R001"],
+        criteria=[QualityCriterion.SRS_UNAMBIGUOUS],
+        evidence=[
+            EvidenceRef(version=SHA, block_id="B001", start=0, end=len(doc.version.blocks[0].text), quote=doc.version.blocks[0].text, grounding=GroundingStatus.EXACT),
+        ],
+        semantic_status=SemanticStatus.UNCHECKED,
+        verification_reason="Ожидает проверки.",
+    )
+    from src.contracts import CriterionEvaluation
+
+    evals = [
+        CriterionEvaluation(requirement_id=None, criterion=QualityCriterion.SET_CONSISTENT, status=CriterionStatus.FAIL, rationale="Конфликт.", finding_ids=["F001"]),
+        CriterionEvaluation(requirement_id=None, criterion=QualityCriterion.SRS_UNAMBIGUOUS, status=CriterionStatus.FAIL, rationale="Неясно.", finding_ids=["F002"]),
+    ]
+
+    calls = 0
+
+    def fake_verify(stage, payload: VerificationPayload, output_type, *, settings=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ProviderError(
+                "Truncated structured response (MAX_TOKENS)",
+                reason=FailureReason.TRUNCATED,
+                action=FailureAction.SPLIT,
+                attempts=1,
+            )
+        if payload.candidates[0].candidate_id == "F001":
+            return StageResult[VerificationOutput](
+                stage=PipelineStage.VERIFY,
+                output=VerificationOutput(
+                    reviews=[SemanticReview(candidate_id="F001", decision="supported", reason="Подтверждено.")]
+                ),
+                attempts=1,
+            )
+        raise ProviderError("Service unavailable (HTTP 503)", reason=FailureReason.SERVER_ERROR, attempts=3)
+
+    res = verify_findings(
+        [f1, f2],
+        doc,
+        ProviderSettings(api_key="test"),
+        evaluations=evals,
+        generate_fn=fake_verify,
+    )
+
+    assert calls == 3
+    by_id = {f.finding_id: f for f in res.findings}
+    assert by_id["F001"].semantic_status == SemanticStatus.SUPPORTED
+    assert by_id["F002"].semantic_status == SemanticStatus.UNCHECKED
+    assert res.incomplete_reasons
+    eval_map = {e.criterion: e for e in res.evaluations}
+    assert eval_map[QualityCriterion.SET_CONSISTENT].status == CriterionStatus.FAIL
+    assert eval_map[QualityCriterion.SRS_UNAMBIGUOUS].status == CriterionStatus.UNKNOWN
+    assert eval_map[QualityCriterion.SRS_UNAMBIGUOUS].finding_ids == []

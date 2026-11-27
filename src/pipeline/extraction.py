@@ -1,6 +1,7 @@
 """Atomic requirement extraction with budget-aware batching and evidence grounding."""
 from collections.abc import Callable
 from dataclasses import dataclass
+import inspect
 import re
 
 from pydantic import Field
@@ -228,18 +229,25 @@ def plan_extraction_batches(
 
     raw_groups: list[list[_TargetUnit]] = []
     current_group: list[_TargetUnit] = []
+    current_block_ids: set[str] = set()
     current_in = 0
     current_out = 0
     for unit in units:
         u_in = _estimate_unit_input_tokens(unit)
         u_out = _estimate_unit_output_tokens(unit)
-        if current_group and (current_in + u_in > input_cap or current_out + u_out > output_cap):
+        if current_group and (
+            unit.block.block_id in current_block_ids
+            or current_in + u_in > input_cap
+            or current_out + u_out > output_cap
+        ):
             raw_groups.append(current_group)
             current_group = [unit]
+            current_block_ids = {unit.block.block_id}
             current_in = u_in
             current_out = u_out
         else:
             current_group.append(unit)
+            current_block_ids.add(unit.block.block_id)
             current_in += u_in
             current_out += u_out
     if current_group:
@@ -376,21 +384,20 @@ def _call_provider(
     estimated_input_tokens: int,
     estimated_output_tokens: int,
 ) -> StageResult[ExtractionOutput]:
-    if generate_fn is generate:
-        return generate_fn(
-            PipelineStage.EXTRACT,
-            payload,
-            ExtractionOutput,
-            settings=settings,
-            budget=budget,
-            estimated_input_tokens=estimated_input_tokens,
-            estimated_output_tokens=estimated_output_tokens,
-        )
+    params = inspect.signature(generate_fn).parameters
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    kwargs: dict[str, object] = {"settings": settings}
+    if accepts_var_kw or "budget" in params:
+        kwargs["budget"] = budget
+    if accepts_var_kw or "estimated_input_tokens" in params:
+        kwargs["estimated_input_tokens"] = estimated_input_tokens
+    if accepts_var_kw or "estimated_output_tokens" in params:
+        kwargs["estimated_output_tokens"] = estimated_output_tokens
     return generate_fn(
         PipelineStage.EXTRACT,
         payload,
         ExtractionOutput,
-        settings=settings,
+        **kwargs,
     )
 
 
@@ -587,9 +594,23 @@ def extract_requirements(
         if batch_fully_accounted:
             completed_batches.append(batch.batch_id)
 
+    # Determine fully completed blocks first so requirements strictly align with completed blocks
+    # (preserving ValidationReport's disjoint cited_blocks | context_blocks == completed_blocks invariant).
+    eligible_blocks: set[str] = set()
+    for bid in planned_blocks:
+        if bid in block_failed:
+            continue
+        if block_completed_chunks.get(bid, 0) < block_planned_chunks.get(bid, 1):
+            incomplete_reasons.append(f"Блок {bid} обработан не полностью.")
+            continue
+        eligible_blocks.add(bid)
+
+    eligible_records = [
+        rec for rec in grounded_by_anchor.values() if rec[3].block_id in eligible_blocks
+    ]
     # Sort deduplicated grounded requirements in strict source order and assign stable IDs.
     ordered_records = sorted(
-        grounded_by_anchor.values(),
+        eligible_records,
         key=lambda rec: (block_order[rec[3].block_id], rec[3].start, rec[3].end, rec[2]),
     )
     requirements = [
@@ -607,10 +628,7 @@ def extract_requirements(
     completed_blocks: list[str] = []
     final_context_blocks: dict[str, str] = {}
     for bid in planned_blocks:
-        if bid in block_failed:
-            continue
-        if block_completed_chunks.get(bid, 0) < block_planned_chunks.get(bid, 1):
-            incomplete_reasons.append(f"Блок {bid} обработан не полностью.")
+        if bid not in eligible_blocks:
             continue
         if bid in cited_blocks:
             completed_blocks.append(bid)

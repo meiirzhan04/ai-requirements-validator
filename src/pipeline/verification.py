@@ -1,5 +1,6 @@
 """Independent semantic verification pass for major and critical finding candidates."""
 from collections.abc import Callable
+import inspect
 
 from pydantic import Field
 
@@ -90,7 +91,13 @@ def reconcile_evaluations_with_findings(
             reconciled.append(ev)
             continue
         linked = [findings_by_id[fid] for fid in ev.finding_ids if fid in findings_by_id]
-        confirmed_ids = [f.finding_id for f in linked if f.confirmed and ev.criterion in f.criteria]
+        confirmed_ids = [
+            f.finding_id
+            for f in linked
+            if f.confirmed
+            and ev.criterion in f.criteria
+            and (ev.requirement_id is None or ev.requirement_id in f.requirement_ids)
+        ]
         if confirmed_ids:
             reconciled.append(ev.model_copy(update={"finding_ids": confirmed_ids}))
         elif linked and all(f.semantic_status == SemanticStatus.REFUTED for f in linked):
@@ -116,26 +123,33 @@ def reconcile_evaluations_with_findings(
     return reconciled
 
 
+def _estimate_tokens(text: str) -> int:
+    return max(1, (len(text) + 2) // 3)
+
+
 def _call_provider(
     generate_fn: GenerateFn,
     payload: VerificationPayload,
     *,
     settings: ProviderSettings,
     budget: QuotaBudget | None,
+    estimated_input_tokens: int = 0,
+    estimated_output_tokens: int = 0,
 ) -> StageResult[VerificationOutput]:
-    if generate_fn is generate:
-        return generate_fn(
-            PipelineStage.VERIFY,
-            payload,
-            VerificationOutput,
-            settings=settings,
-            budget=budget,
-        )
+    params = inspect.signature(generate_fn).parameters
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    kwargs: dict[str, object] = {"settings": settings}
+    if accepts_var_kw or "budget" in params:
+        kwargs["budget"] = budget
+    if accepts_var_kw or "estimated_input_tokens" in params:
+        kwargs["estimated_input_tokens"] = estimated_input_tokens
+    if accepts_var_kw or "estimated_output_tokens" in params:
+        kwargs["estimated_output_tokens"] = estimated_output_tokens
     return generate_fn(
         PipelineStage.VERIFY,
         payload,
         VerificationOutput,
-        settings=settings,
+        **kwargs,
     )
 
 
@@ -174,9 +188,16 @@ def verify_findings(
     known_out = 0
     has_known_usage = False
 
-    for batch_num, offset in enumerate(range(0, len(targets), max(1, batch_size)), start=1):
-        batch = targets[offset : offset + max(1, batch_size)]
-        batch_id = f"verify-{batch_num}"
+    step = max(1, batch_size)
+    queue: list[tuple[str, list[Finding]]] = [
+        (f"verify-{batch_num}", targets[offset : offset + step])
+        for batch_num, offset in enumerate(range(0, len(targets), step), start=1)
+    ]
+
+    q_idx = 0
+    while q_idx < len(queue):
+        batch_id, batch = queue[q_idx]
+        q_idx += 1
         target_ids = {f.finding_id for f in batch}
 
         # Collect cited blocks + neighboring blocks from same sections to expose exceptions/conditions.
@@ -233,6 +254,8 @@ def verify_findings(
             )
 
         payload = _make_payload()
+        est_in = _estimate_tokens(payload.model_dump_json())
+        est_out = len(batch) * 180
         stage_result: StageResult[VerificationOutput] | None = None
         stop_all = False
 
@@ -243,6 +266,8 @@ def verify_findings(
                     payload,
                     settings=settings,
                     budget=budget,
+                    estimated_input_tokens=est_in,
+                    estimated_output_tokens=est_out,
                 )
                 total_attempts += stage_result.attempts
                 if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
@@ -255,6 +280,14 @@ def verify_findings(
                 if exc.action == FailureAction.REPAIR and repair_attempt == 0:
                     payload = _make_payload(repair_hint=VERIFICATION_REPAIR_HINT)
                     continue
+                if exc.action == FailureAction.SPLIT and len(batch) > 1:
+                    mid = len(batch) // 2
+                    queue[q_idx:q_idx] = [
+                        (f"{batch_id}.1", batch[:mid]),
+                        (f"{batch_id}.2", batch[mid:]),
+                    ]
+                    stage_result = None
+                    break
                 incomplete_reasons.append(f"Пакет семантической проверки {batch_id} не завершён: {exc}.")
                 if exc.reason in _STOP_ALL_REASONS:
                     stop_all = True

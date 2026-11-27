@@ -1,6 +1,7 @@
 """Individual requirement auditing against the 9 ISO/IEC/IEEE 29148:2018 criteria."""
 from collections.abc import Callable
 from dataclasses import dataclass
+import inspect
 import re
 
 from pydantic import Field
@@ -187,21 +188,20 @@ def _call_provider(
     estimated_input_tokens: int,
     estimated_output_tokens: int,
 ) -> StageResult[IndividualAuditOutput]:
-    if generate_fn is generate:
-        return generate_fn(
-            PipelineStage.INDIVIDUAL,
-            payload,
-            IndividualAuditOutput,
-            settings=settings,
-            budget=budget,
-            estimated_input_tokens=estimated_input_tokens,
-            estimated_output_tokens=estimated_output_tokens,
-        )
+    params = inspect.signature(generate_fn).parameters
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    kwargs: dict[str, object] = {"settings": settings}
+    if accepts_var_kw or "budget" in params:
+        kwargs["budget"] = budget
+    if accepts_var_kw or "estimated_input_tokens" in params:
+        kwargs["estimated_input_tokens"] = estimated_input_tokens
+    if accepts_var_kw or "estimated_output_tokens" in params:
+        kwargs["estimated_output_tokens"] = estimated_output_tokens
     return generate_fn(
         PipelineStage.INDIVIDUAL,
         payload,
         IndividualAuditOutput,
-        settings=settings,
+        **kwargs,
     )
 
 
@@ -210,8 +210,9 @@ def _ground_finding_candidate(
     requirement: Requirement,
     document: ParsedDocument,
     ground_fn: GroundFn,
+    *,
+    allowed_block_ids: set[str],
 ) -> tuple[_DraftFinding | None, str | None]:
-    valid_block_ids = {b.block_id for b in document.version.blocks}
     if any(c not in INDIVIDUAL for c in candidate.criteria):
         return None, f"Находка {candidate.local_key} ({requirement.req_id}): критерий вне индивидуального каталога ISO."
 
@@ -223,9 +224,9 @@ def _ground_finding_candidate(
     grounded_refs: list[EvidenceRef] = []
     seen_anchors: set[tuple[str, str, int, int]] = set()
     for ev in candidate.evidence:
-        if ev.block_id not in valid_block_ids:
+        if ev.block_id not in allowed_block_ids:
             return None, (
-                f"Находка {candidate.local_key} ({requirement.req_id}): ссылка на неизвестный блок {ev.block_id}."
+                f"Находка {candidate.local_key} ({requirement.req_id}): ссылка на неизвестный или непроверенный блок {ev.block_id}."
             )
         if not ev.quote.strip():
             return None, f"Находка {candidate.local_key} ({requirement.req_id}): пустая цитата доказательства."
@@ -305,6 +306,7 @@ def audit_individual_requirements(
     document: ParsedDocument,
     settings: ProviderSettings,
     *,
+    inspected_blocks: set[str] | list[str] | None = None,
     budget: QuotaBudget | None = None,
     generate_fn: GenerateFn = generate,
     ground_fn: GroundFn = ground,
@@ -316,7 +318,12 @@ def audit_individual_requirements(
     """Audit each requirement against all 9 individual ISO criteria with strict grounding."""
     planned_reqs = [req.req_id for req in requirements]
     req_order = {req_id: idx for idx, req_id in enumerate(planned_reqs)}
-    req_by_id = {req.req_id: req for req in requirements}
+    all_block_ids = {b.block_id for b in document.version.blocks}
+    allowed_block_ids = (
+        all_block_ids
+        if inspected_blocks is None
+        else ((set(inspected_blocks) & all_block_ids) | {r.source.block_id for r in requirements if r.source.block_id in all_block_ids})
+    )
 
     if not planned_reqs:
         return IndividualAuditResult(
@@ -482,20 +489,29 @@ def audit_individual_requirements(
                         f"Требование {rid}: ссылка на отсутствующую находку {key}."
                     )
                     continue
-                draft, err_msg = _ground_finding_candidate(fc, req, document, ground_fn)
+                draft, err_msg = _ground_finding_candidate(
+                    fc,
+                    req,
+                    document,
+                    ground_fn,
+                    allowed_block_ids=allowed_block_ids,
+                )
                 if err_msg is not None or draft is None:
                     req_errors[rid].append(err_msg or f"Требование {rid}: невалидная находка {key}.")
                     continue
                 grounded_by_key[key] = draft
 
-            # Verify each failed criterion is declared on every finding it references.
+            # Synchronize each finding's criteria strictly with the FAIL evaluations citing it
+            # so ValidationReport's cited == declared invariant always holds on confirmed findings.
+            cited_criteria_by_key: dict[str, set[QualityCriterion]] = {}
             for crit, ev in seen_criteria.items():
                 if ev.status != CriterionStatus.FAIL:
                     continue
                 for key in ev.local_finding_keys:
-                    draft = grounded_by_key.get(key)
-                    if draft is not None and crit not in draft.criteria:
-                        draft.criteria.add(crit)
+                    if key in grounded_by_key:
+                        cited_criteria_by_key.setdefault(key, set()).add(crit)
+            for key, draft in grounded_by_key.items():
+                draft.criteria = cited_criteria_by_key.get(key, set())
 
             if req_errors[rid]:
                 batch_clean = False

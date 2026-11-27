@@ -1,5 +1,6 @@
 """Targeted stakeholder clarification question engine built on validated findings."""
 from collections.abc import Callable
+import inspect
 import re
 
 from pydantic import Field
@@ -130,26 +131,33 @@ def _validate_and_build_options(candidate: QuestionCandidate) -> list[QuestionOp
     return options if len(options) >= 2 else None
 
 
+def _estimate_tokens(text: str) -> int:
+    return max(1, (len(text) + 2) // 3)
+
+
 def _call_provider(
     generate_fn: GenerateFn,
     payload: QuestionGenerationPayload,
     *,
     settings: ProviderSettings,
     budget: QuotaBudget | None,
+    estimated_input_tokens: int = 0,
+    estimated_output_tokens: int = 0,
 ) -> StageResult[QuestionGenerationOutput]:
-    if generate_fn is generate:
-        return generate_fn(
-            PipelineStage.CLARIFY,
-            payload,
-            QuestionGenerationOutput,
-            settings=settings,
-            budget=budget,
-        )
+    params = inspect.signature(generate_fn).parameters
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    kwargs: dict[str, object] = {"settings": settings}
+    if accepts_var_kw or "budget" in params:
+        kwargs["budget"] = budget
+    if accepts_var_kw or "estimated_input_tokens" in params:
+        kwargs["estimated_input_tokens"] = estimated_input_tokens
+    if accepts_var_kw or "estimated_output_tokens" in params:
+        kwargs["estimated_output_tokens"] = estimated_output_tokens
     return generate_fn(
         PipelineStage.CLARIFY,
         payload,
         QuestionGenerationOutput,
-        settings=settings,
+        **kwargs,
     )
 
 
@@ -192,9 +200,16 @@ def generate_questions(
     known_out = 0
     has_known_usage = False
 
-    for batch_num, offset in enumerate(range(0, len(eligible), max(1, batch_size)), start=1):
-        batch = eligible[offset : offset + max(1, batch_size)]
-        batch_id = f"clarify-{batch_num}"
+    step = max(1, batch_size)
+    queue: list[tuple[str, list[Finding]]] = [
+        (f"clarify-{batch_num}", eligible[offset : offset + step])
+        for batch_num, offset in enumerate(range(0, len(eligible), step), start=1)
+    ]
+
+    q_idx = 0
+    while q_idx < len(queue):
+        batch_id, batch = queue[q_idx]
+        q_idx += 1
         batch_fids = {f.finding_id for f in batch}
 
         finding_inputs = [
@@ -230,6 +245,8 @@ def generate_questions(
             )
 
         payload = _make_payload()
+        est_in = _estimate_tokens(payload.model_dump_json())
+        est_out = len(batch) * 260
         stage_result: StageResult[QuestionGenerationOutput] | None = None
         stop_all = False
 
@@ -240,6 +257,8 @@ def generate_questions(
                     payload,
                     settings=settings,
                     budget=budget,
+                    estimated_input_tokens=est_in,
+                    estimated_output_tokens=est_out,
                 )
                 total_attempts += stage_result.attempts
                 if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
@@ -252,6 +271,14 @@ def generate_questions(
                 if exc.action == FailureAction.REPAIR and repair_attempt == 0:
                     payload = _make_payload(repair_hint=QUESTIONS_REPAIR_HINT)
                     continue
+                if exc.action == FailureAction.SPLIT and len(batch) > 1:
+                    mid = len(batch) // 2
+                    queue[q_idx:q_idx] = [
+                        (f"{batch_id}.1", batch[:mid]),
+                        (f"{batch_id}.2", batch[mid:]),
+                    ]
+                    stage_result = None
+                    break
                 incomplete_reasons.append(f"Пакет генерации вопросов {batch_id} не завершён: {exc}.")
                 if exc.reason in _STOP_ALL_REASONS:
                     stop_all = True

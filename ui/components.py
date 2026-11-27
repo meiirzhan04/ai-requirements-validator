@@ -2,6 +2,7 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 import html
+import inspect
 import logging
 import queue
 import threading
@@ -231,6 +232,8 @@ class ProgressTracker:
         self._stages: dict[str, tuple[str, str, float]] = {}
         self.events: list[ProgressEvent] = []
         self.retry_notices: list[str] = []
+        self.last_stage: str | None = None
+        self.last_state: str | None = None
 
     @property
     def elapsed_seconds(self) -> float:
@@ -240,6 +243,8 @@ class ProgressTracker:
         elapsed = self.elapsed_seconds
         self.events.append(event)
         stage_key = str(event.stage)
+        self.last_stage = stage_key
+        self.last_state = event.state
         stage_name = self._stage_labels.get(stage_key, stage_key)
         state_name = self._state_labels.get(event.state, event.state)
         self._stages[stage_key] = (event.state, event.message, elapsed)
@@ -301,7 +306,13 @@ class ProgressTracker:
             self._render_event(event)
 
 
-def run_with_progress(tracker: ProgressTracker, fn: Callable[..., T], *args, **kwargs) -> T:
+def run_with_progress(
+    tracker: ProgressTracker,
+    fn: Callable[..., T],
+    *args,
+    run_id: str | None = None,
+    **kwargs,
+) -> T:
     """Execute a blocking pipeline call in a worker thread and render ProgressEvents on the script thread."""
     event_queue: queue.SimpleQueue[ProgressEvent] = queue.SimpleQueue()
 
@@ -316,8 +327,18 @@ def run_with_progress(tracker: ProgressTracker, fn: Callable[..., T], *args, **k
                 break
             tracker.handle(queued)
 
+    call_kwargs = dict(kwargs)
+    if run_id is not None:
+        try:
+            params = inspect.signature(fn).parameters
+            accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            if accepts_var_kw or "run_id" in params:
+                call_kwargs["run_id"] = run_id
+        except (TypeError, ValueError):
+            pass
+
     with ThreadPoolExecutor(max_workers=1, thread_name_prefix="rv-pipeline") as pool:
-        future = pool.submit(fn, *args, on_progress=_enqueue, **kwargs)
+        future = pool.submit(fn, *args, on_progress=_enqueue, **call_kwargs)
         while not future.done():
             try:
                 queued = event_queue.get(timeout=0.05)

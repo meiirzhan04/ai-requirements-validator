@@ -3,6 +3,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import inspect
+import logging
 import re
 
 from pydantic import Field
@@ -29,6 +30,7 @@ from src.contracts import (
 )
 from src.contracts.source import Contract, Count, Id, Text
 from src.evidence import ground
+from src.pipeline.diagnostics import log_safe_exception
 from src.prompts.individual import (
     INDIVIDUAL_PROMPT_VERSION,
     INDIVIDUAL_REPAIR_HINT,
@@ -45,6 +47,7 @@ from src.provider.dto import (
 
 GenerateFn = Callable[..., StageResult[IndividualAuditOutput]]
 GroundFn = Callable[[EvidenceCandidate, ParsedDocument], GroundingResult]
+logger = logging.getLogger(__name__)
 
 _HEADROOM_FACTOR = 0.8
 _INDIVIDUAL_ORDERED = tuple(sorted(INDIVIDUAL, key=lambda c: c.value))
@@ -317,6 +320,7 @@ def _execute_individual_batch(
     settings: ProviderSettings,
     budget: QuotaBudget | None,
     generate_fn: GenerateFn,
+    run_id: str = "unspecified",
 ) -> tuple[StageResult[IndividualAuditOutput] | None, ProviderError | None, int]:
     payload = _build_payload(batch, document)
     est_in = _estimate_tokens(payload.model_dump_json(exclude={"system_instruction"}, exclude_none=True))
@@ -340,6 +344,24 @@ def _execute_individual_batch(
                 payload = _build_payload(batch, document, repair_hint=INDIVIDUAL_REPAIR_HINT)
                 continue
             return None, exc, attempts
+        except Exception as exc:
+            log_safe_exception(
+                logger,
+                "individual_batch_unexpected_error",
+                exc,
+                run_id=run_id,
+                stage=PipelineStage.INDIVIDUAL.value,
+            )
+            return (
+                None,
+                ProviderError(
+                    f"Внутренняя ошибка пакета ({type(exc).__name__})",
+                    reason=FailureReason.API_ERROR,
+                    action=FailureAction.STOP,
+                    attempts=max(attempts, 0),
+                ),
+                attempts,
+            )
     return None, None, attempts
 
 
@@ -528,6 +550,7 @@ def audit_individual_requirements(
     max_requirements_per_batch: int = 10,
     finding_id_start: int = 1,
     max_concurrency: int = 1,
+    run_id: str | None = None,
 ) -> IndividualAuditResult:
     """Audit each requirement against all 9 individual ISO criteria with strict grounding."""
     planned_reqs = [req.req_id for req in requirements]
@@ -569,6 +592,7 @@ def audit_individual_requirements(
     known_out = 0
     has_known_usage = False
     workers = max(1, max_concurrency)
+    diag_run_id = run_id or "unspecified"
 
     pending_wave = list(queue)
     stop_all = False
@@ -579,7 +603,7 @@ def audit_individual_requirements(
                 batch = pending_wave[idx]
                 idx += 1
                 stage_result, exc, batch_attempts = _execute_individual_batch(
-                    batch, document, settings=settings, budget=budget, generate_fn=generate_fn
+                    batch, document, settings=settings, budget=budget, generate_fn=generate_fn, run_id=diag_run_id
                 )
                 total_attempts += batch_attempts
                 if exc is not None:
@@ -629,6 +653,7 @@ def audit_individual_requirements(
                         settings=settings,
                         budget=budget,
                         generate_fn=generate_fn,
+                        run_id=diag_run_id,
                     ),
                 )
                 for b in pending_wave

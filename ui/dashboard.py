@@ -8,6 +8,7 @@ import streamlit as st
 
 from src import ingest, pipeline
 from src.contracts import ProgressEvent, ProviderSettings, ValidationReport
+from src.pipeline.diagnostics import log_safe_exception, new_run_id
 from src.provider import ProviderError, load_settings
 from src.report import (
     CRITERION_STATUS,
@@ -160,28 +161,68 @@ def analyze() -> ValidationReport | None:
             failures[key] = "Ключ Gemini отсутствует. Укажите GEMINI_API_KEY в окружении сервера."
             st.error(failures[key])
             return None
+        run_id = new_run_id()
+        current_stage = "ingest"
+        logger.info(
+            "run=%s event=ui_analyze_started format=%s bytes=%d model=%s",
+            run_id,
+            Path(filename).suffix.lower() or "unknown",
+            len(data),
+            model,
+        )
         with st.status("Обработка документа", expanded=True) as status:
             tracker = ProgressTracker(status, STAGE, STATE)
             try:
                 document = ingest.parse(filename, data)
+                current_stage = "extract"
                 configured = ProviderSettings(api_key=settings.api_key, model=model, timeout_ms=timeout)
-                result = run_with_progress(tracker, pipeline.run_pipeline, document, configured)
+                result = run_with_progress(tracker, pipeline.run_pipeline, document, configured, run_id=run_id)
                 if result.metadata.origin != "live" or result.document.version.sha256 != digest:
                     raise ValueError("Report identity mismatch")
             except ProviderError as error:
-                logger.warning("ui_analyze_provider_error reason=%s", error.reason.value)
-                failures[key] = f"Сбой Gemini · {error.reason.value}"
+                failed_stage = tracker.last_stage or current_stage
+                log_safe_exception(
+                    logger,
+                    "ui_analyze_provider_error",
+                    error,
+                    run_id=run_id,
+                    stage=failed_stage,
+                    level=logging.WARNING,
+                )
+                failures[key] = f"Сбой Gemini · {error.reason.value} (код диагностики: {run_id})"
             except NotImplementedError:
-                failures[key] = "Модуль обработки ещё не подключён"
+                failures[key] = f"Модуль обработки ещё не подключён (код диагностики: {run_id})"
             except (ValueError, OSError) as error:
-                logger.warning("ui_analyze_input_error error_type=%s", type(error).__name__)
-                failures[key] = "Проверка прервана. Проверьте формат и целостность документа."
+                failed_stage = tracker.last_stage or current_stage
+                log_safe_exception(
+                    logger,
+                    "ui_analyze_input_error",
+                    error,
+                    run_id=run_id,
+                    stage=failed_stage,
+                    level=logging.WARNING,
+                )
+                failures[key] = f"Проверка прервана. Проверьте формат и целостность документа (код диагностики: {run_id})."
             except Exception as error:
                 # Provider and parser exceptions may include credentials or private input.
-                logger.error("ui_analyze_internal_error error_type=%s", type(error).__name__)
-                failures[key] = "Внутренняя ошибка обработки документа"
+                failed_stage = tracker.last_stage or current_stage
+                log_safe_exception(
+                    logger,
+                    "ui_analyze_internal_error",
+                    error,
+                    run_id=run_id,
+                    stage=failed_stage,
+                    level=logging.ERROR,
+                )
+                stage_label = STAGE.get(failed_stage, failed_stage)
+                failures[key] = (
+                    f"Внутренняя ошибка обработки документа · этап: {stage_label} · "
+                    f"код диагностики: {run_id}"
+                )
             if key in failures:
                 status.update(label=failures[key], state="error")
+                if history:
+                    st.caption("Предыдущие успешно сформированные отчёты в этом сеансе сохранены.")
                 return None
             history[key] = result
             status.update(
@@ -190,6 +231,8 @@ def analyze() -> ValidationReport | None:
             )
     elif key in failures:
         st.error(failures[key])
+        if history:
+            st.caption("Предыдущие успешно сформированные отчёты в этом сеансе сохранены.")
 
     active_report = history.get(key)
     if active_report is None and upload is None and history:

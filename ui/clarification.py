@@ -3,7 +3,7 @@ from hashlib import sha256
 
 import streamlit as st
 
-from src import pipeline
+from ui.progress import finish_job, pending_job, run_with_progress
 from src.clarification import propose_change, working_document
 from src.contracts import Answer, ExecutionStatus, ProposedChange, ProviderSettings, ValidationReport
 from src.provider import ProviderError
@@ -244,37 +244,33 @@ def render_clarification(report: ValidationReport, settings: ProviderSettings) -
         "Разрешаю передать исправленный документ в Google Gemini",
         key=edit_key + "-consent-" + child.version.sha256,
     )
-    if (
-        st.button(
-            "Повторить полный анализ",
-            type="primary",
-            disabled=not consent or run_key in result_store,
-            key=key + "-rerun",
-        )
-        and consent
-        and run_key not in result_store
-    ):
+    submitted = st.button(
+        "Повторить полный анализ",
+        type="primary",
+        disabled=not consent or run_key in result_store,
+        key=key + "-rerun",
+    )
+    if (submitted or pending_job(run_key)) and consent and run_key not in result_store:
         if not settings.api_key:
             st.error("Для повторной проверки требуется ключ Gemini.")
             return
         with st.status("Повторный анализ рабочей версии", expanded=True) as status:
             tracker = ProgressTracker(status, STAGE, STATE)
             try:
-                result = pipeline.run_pipeline(
-                    child,
-                    settings,
-                    on_progress=tracker.handle,
-                )
+                result = run_with_progress(run_key, child, settings, tracker)
                 if result.document != child or result.metadata.origin != "live":
                     raise ValueError("Unexpected report version or origin")
                 result_store[run_key] = result
+                finish_job(run_key)
                 status.update(
                     label=f"Получен результат повторной проверки · {tracker.elapsed_seconds:.1f} с",
                     state="error" if result.coverage.execution == "failed" else "complete",
                 )
             except ProviderError as error:
+                finish_job(run_key)
                 status.update(label=f"Сбой Gemini · {error.reason.value}", state="error")
             except Exception:
+                finish_job(run_key)
                 status.update(
                     label="Повторная проверка не завершена. Исходный отчёт сохранён.",
                     state="error",

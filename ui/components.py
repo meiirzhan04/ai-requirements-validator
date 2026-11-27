@@ -207,8 +207,11 @@ class ProgressTracker:
     def elapsed_seconds(self) -> float:
         return max(0.0, time.monotonic() - self._started)
 
-    def handle(self, event: ProgressEvent) -> None:
-        elapsed = self.elapsed_seconds
+    def start_at(self, started: float) -> None:
+        self._started = started
+
+    def handle(self, event: ProgressEvent, timestamp: float | None = None) -> None:
+        elapsed = self.elapsed_seconds if timestamp is None else max(0.0, timestamp - self._started)
         self.events.append(event)
         stage_key = str(event.stage)
         stage_name = self._stage_labels.get(stage_key, stage_key)

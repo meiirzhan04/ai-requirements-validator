@@ -1,4 +1,6 @@
 """Comprehensive UI/UX, design-system, and workflow tests for Issue #36."""
+from concurrent.futures import ThreadPoolExecutor
+from threading import Barrier
 from copy import deepcopy
 from hashlib import sha256
 from pathlib import Path
@@ -93,6 +95,14 @@ def test_upload_boundary_missing_key_and_real_progress_with_retry_notice(report,
             on_progress(ProgressEvent(stage="ingest", state="completed", message="Проверено блоков: 2"))
             on_progress(ProgressEvent(stage="extract", state="started", message="Повтор после HTTP 503 (ожидание 1.0 с)"))
             on_progress(ProgressEvent(stage="extract", state="completed", message="Извлечено требований: 2"))
+            ready = Barrier(2)
+
+            def audit(stage):
+                ready.wait(timeout=5)
+                on_progress(ProgressEvent(stage=stage, state="completed", message=stage))
+
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                list(pool.map(audit, ["individual_audit", "set_audit"]))
             on_progress(ProgressEvent(stage="report", state="completed", message="Отчёт готов"))
         return live
 
@@ -104,7 +114,9 @@ def test_upload_boundary_missing_key_and_real_progress_with_retry_notice(report,
     assert not app2.exception
 
     all_text = "\n".join(t.value for t in app2.text)
+    assert "individual_audit" in all_text and "set_audit" in all_text
     all_md = "\n".join(m.value for m in app2.markdown)
+    assert "individual_audit" in all_text and "set_audit" in all_text
     assert "Чтение документа" in all_text
     assert "Извлечение требований" in all_text
     assert "Фактическое время:" in all_md
@@ -182,3 +194,47 @@ def test_findings_search_filters_and_no_unimplemented_export_buttons(report, mon
     search_box.set_value("F001").run()
     assert not app.exception
     assert any("F001" in exp.label for exp in app.expander)
+
+
+def test_interrupted_render_resumes_without_duplicate_work(monkeypatch):
+    from types import SimpleNamespace
+    from ui import progress
+
+    monkeypatch.setattr(progress, "st", SimpleNamespace(session_state={}))
+    calls = []
+    event = ProgressEvent(stage="extract", state="completed", message="extracted")
+
+    def run(document, settings, on_progress):
+        calls.append(document)
+        on_progress(event)
+        return document
+
+    class Tracker:
+        def start_at(self, started):
+            self.started = started
+
+        def handle(self, received, timestamp):
+            assert received == event and timestamp >= self.started
+
+    class Interrupted(Tracker):
+        def handle(self, received, timestamp):
+            raise InterruptedError
+
+    monkeypatch.setattr(pipeline, "run_pipeline", run)
+    with pytest.raises(InterruptedError):
+        progress.run_with_progress("revision-1", "old", None, Interrupted())
+    assert progress.run_with_progress("revision-2", "new", None, Tracker()) == "new"
+    assert progress.run_with_progress("revision-1", "old", None, Tracker()) == "old"
+    assert calls == ["old", "new"]
+
+
+def test_worker_diagnostics_exclude_private_exception(monkeypatch, caplog):
+    from unittest.mock import Mock
+    from ui import progress
+
+    monkeypatch.setattr(progress, "st", Mock(session_state={}))
+    monkeypatch.setattr(pipeline, "run_pipeline", Mock(side_effect=ValueError("private-document")))
+    with pytest.raises(ValueError):
+        progress.run_with_progress("revision", None, None, Mock())
+    assert "Analysis worker failed (ValueError)" in caplog.text
+    assert "private-document" not in caplog.text

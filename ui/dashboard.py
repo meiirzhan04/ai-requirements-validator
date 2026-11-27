@@ -4,8 +4,9 @@ import html
 
 import streamlit as st
 
-from src import ingest, pipeline
-from src.contracts import ProgressEvent, ProviderSettings, ValidationReport
+from src import ingest
+from ui.progress import finish_job, pending_job, run_with_progress
+from src.contracts import ProviderSettings, ValidationReport
 from src.provider import ProviderError, load_settings
 from src.report import (
     CRITERION_STATUS,
@@ -149,7 +150,7 @@ def analyze() -> ValidationReport | None:
             col_info.caption("Отметьте согласие на облачную обработку, чтобы активировать запуск.")
 
     failures = st.session_state.setdefault("analysis_errors", {})
-    if submitted and consent and key not in history:
+    if (submitted or pending_job(key)) and consent and key not in history:
         failures.pop(key, None)
         if not settings.api_key:
             failures[key] = "Ключ Gemini отсутствует. Укажите GEMINI_API_KEY в окружении сервера."
@@ -158,13 +159,10 @@ def analyze() -> ValidationReport | None:
         with st.status("Обработка документа", expanded=True) as status:
             tracker = ProgressTracker(status, STAGE, STATE)
 
-            def progress(event: ProgressEvent) -> None:
-                tracker.handle(event)
-
             try:
                 document = ingest.parse(filename, data)
                 configured = ProviderSettings(api_key=settings.api_key, model=model, timeout_ms=timeout)
-                result = pipeline.run_pipeline(document, configured, on_progress=progress)
+                result = run_with_progress(key, document, configured, tracker)
                 if result.metadata.origin != "live" or result.document.version.sha256 != digest:
                     raise ValueError("Report identity mismatch")
             except ProviderError as error:
@@ -177,9 +175,11 @@ def analyze() -> ValidationReport | None:
                 # Provider and parser exceptions may include credentials or private input.
                 failures[key] = "Внутренняя ошибка обработки документа"
             if key in failures:
+                finish_job(key)
                 status.update(label=failures[key], state="error")
                 return None
             history[key] = result
+            finish_job(key)
             status.update(
                 label=f"{EXECUTION[result.coverage.execution]} анализ · {tracker.elapsed_seconds:.1f} с",
                 state="error" if result.coverage.execution == "failed" else "complete",

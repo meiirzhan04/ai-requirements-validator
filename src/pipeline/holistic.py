@@ -2,6 +2,7 @@
 from collections import defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass
+import inspect
 import re
 
 from pydantic import Field
@@ -159,12 +160,17 @@ def _has_independent_anchors(refs: list[EvidenceRef]) -> bool:
     )
 
 
+def _estimate_tokens(text: str) -> int:
+    return max(1, (len(text) + 2) // 3)
+
+
 def build_cross_section_groups(
     requirements: list[Requirement],
     document: ParsedDocument,
     *,
-    max_requirements_per_group: int = 12,
-    max_passages_per_group: int = 16,
+    max_requirements_per_group: int = 24,
+    max_passages_per_group: int = 36,
+    max_cross_groups: int = 8,
 ) -> list[CrossSectionGroup]:
     """Index entities/endpoints/conditions and build cross-section comparison groups."""
     if not requirements:
@@ -205,33 +211,51 @@ def build_cross_section_groups(
             ranked_terms.append((len(sections), len(matched), term))
     ranked_terms.sort(key=lambda item: (-item[0], -item[1], item[2]))
 
-    groups: list[CrossSectionGroup] = []
-    covered_reqs: set[str] = set()
+    # Greedily cluster cross-section term matches to keep API call count bounded while preserving distant pairs.
+    clusters: list[tuple[list[str], list[str], list[str]]] = []
     seen_req_sets: set[frozenset[str]] = set()
+    req_by_id = {r.req_id: r for r in requirements}
 
     for _, _, term in ranked_terms:
         matched = term_to_reqs[term][:max_requirements_per_group]
-        req_ids = tuple(dict.fromkeys(r.req_id for r in matched))
+        req_ids = list(dict.fromkeys(r.req_id for r in matched))
         req_set = frozenset(req_ids)
-        if req_set in seen_req_sets:
+        if req_set in seen_req_sets or any(req_set <= existing for existing in seen_req_sets):
             continue
-        # Avoid creating redundant sub-groups already fully covered unless introducing new pairs.
-        if any(req_set <= existing for existing in seen_req_sets):
-            continue
-        seen_req_sets.add(req_set)
-        covered_reqs.update(req_ids)
-        blk_ids = tuple(
-            sorted(
+
+        merged = False
+        for keywords, c_reqs, c_blks in clusters:
+            combined_reqs = list(dict.fromkeys([*c_reqs, *req_ids]))
+            combined_blks = sorted(
+                {req_by_id[rid].source.block_id for rid in combined_reqs if req_by_id[rid].source.block_id in block_order},
+                key=lambda bid: block_order[bid],
+            )
+            if len(combined_reqs) <= max_requirements_per_group and len(combined_blks) <= max_passages_per_group:
+                if term not in keywords:
+                    keywords.append(term)
+                c_reqs[:] = combined_reqs
+                c_blks[:] = combined_blks
+                seen_req_sets.add(frozenset(combined_reqs))
+                merged = True
+                break
+        if not merged and len(clusters) < max(1, max_cross_groups):
+            blk_ids = sorted(
                 {r.source.block_id for r in matched if r.source.block_id in block_order},
                 key=lambda bid: block_order[bid],
             )[:max_passages_per_group]
-        )
+            clusters.append(([term], req_ids, blk_ids))
+            seen_req_sets.add(req_set)
+
+    groups: list[CrossSectionGroup] = []
+    covered_reqs: set[str] = set()
+    for keywords, req_ids, blk_ids in clusters:
+        covered_reqs.update(req_ids)
         groups.append(
             CrossSectionGroup(
                 group_id=f"cross-{len(groups) + 1}",
-                topic_keywords=(term,),
-                requirement_ids=req_ids,
-                block_ids=blk_ids,
+                topic_keywords=tuple(keywords),
+                requirement_ids=tuple(req_ids),
+                block_ids=tuple(blk_ids),
             )
         )
 
@@ -485,21 +509,51 @@ def _call_provider(
     *,
     settings: ProviderSettings,
     budget: QuotaBudget | None,
+    estimated_input_tokens: int = 0,
+    estimated_output_tokens: int = 0,
 ) -> StageResult[HolisticAuditOutput]:
-    if generate_fn is generate:
-        return generate_fn(
-            PipelineStage.HOLISTIC,
-            payload,
-            HolisticAuditOutput,
-            settings=settings,
-            budget=budget,
-        )
+    params = inspect.signature(generate_fn).parameters
+    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+    kwargs: dict[str, object] = {"settings": settings}
+    if accepts_var_kw or "budget" in params:
+        kwargs["budget"] = budget
+    if accepts_var_kw or "estimated_input_tokens" in params:
+        kwargs["estimated_input_tokens"] = estimated_input_tokens
+    if accepts_var_kw or "estimated_output_tokens" in params:
+        kwargs["estimated_output_tokens"] = estimated_output_tokens
     return generate_fn(
         PipelineStage.HOLISTIC,
         payload,
         HolisticAuditOutput,
-        settings=settings,
+        **kwargs,
     )
+
+
+def _split_group(
+    group: CrossSectionGroup,
+    req_map: dict[str, Requirement],
+    block_order: dict[str, int],
+) -> list[CrossSectionGroup] | None:
+    if len(group.requirement_ids) <= 1:
+        return None
+    mid = len(group.requirement_ids) // 2
+    parts: list[CrossSectionGroup] = []
+    for idx, sub_reqs in enumerate((group.requirement_ids[:mid], group.requirement_ids[mid:]), start=1):
+        sub_blks = tuple(
+            sorted(
+                {req_map[rid].source.block_id for rid in sub_reqs if rid in req_map and req_map[rid].source.block_id in block_order},
+                key=lambda bid: block_order[bid],
+            )
+        )
+        parts.append(
+            CrossSectionGroup(
+                group_id=f"{group.group_id}.{idx}",
+                topic_keywords=group.topic_keywords,
+                requirement_ids=sub_reqs,
+                block_ids=sub_blks,
+            )
+        )
+    return parts
 
 
 def audit_holistic_set(
@@ -511,7 +565,8 @@ def audit_holistic_set(
     budget: QuotaBudget | None = None,
     generate_fn: GenerateFn = generate,
     ground_fn: GroundFn = ground,
-    max_requirements_per_group: int = 12,
+    max_requirements_per_group: int = 24,
+    max_passages_per_group: int = 36,
     finding_id_start: int = 1,
 ) -> HolisticAuditResult:
     """Audit whole-specification ISO/IEEE properties across cross-section groups."""
@@ -535,6 +590,7 @@ def audit_holistic_set(
         requirements,
         document,
         max_requirements_per_group=max_requirements_per_group,
+        max_passages_per_group=max_passages_per_group,
     )
     planned_groups = [g.group_id for g in groups]
     if not groups:
@@ -558,20 +614,37 @@ def audit_holistic_set(
     has_known_usage = False
     temp_finding_seq = 0
 
-    for group in groups:
-        group_inspected = sorted(
-            effective_inspected & set(group.block_ids) if group.block_ids else effective_inspected,
-            key=lambda bid: block_order[bid],
+    queue = list(groups)
+    q_idx = 0
+    while q_idx < len(queue):
+        group = queue[q_idx]
+        q_idx += 1
+
+        if group.group_id == "whole-spec":
+            # Include all inspected blocks (including context blocks) when they fit in the passage budget.
+            scope_candidates = sorted(effective_inspected, key=lambda bid: block_order[bid])
+            if len(scope_candidates) <= max_passages_per_group:
+                selected_passage_ids = scope_candidates
+            else:
+                req_blks = sorted(effective_inspected & set(group.block_ids), key=lambda bid: block_order[bid])
+                selected_passage_ids = req_blks[:max_passages_per_group]
+        else:
+            selected_passage_ids = sorted(
+                effective_inspected & set(group.block_ids) if group.block_ids else effective_inspected,
+                key=lambda bid: block_order[bid],
+            )[:max_passages_per_group]
+
+        group_inspected_set = set(selected_passage_ids)
+        group_has_uninspected_scope = (
+            has_uninspected_scope or group_inspected_set != set(all_block_ids)
         )
-        # Include all inspected blocks in scope metadata when running whole-spec audit.
-        scope_blocks = sorted(effective_inspected, key=lambda bid: block_order[bid])
         passages = [
             HolisticPassageInput(
                 block_id=bid,
                 section=block_map[bid].location.section,
                 text=block_map[bid].text,
             )
-            for bid in group.block_ids
+            for bid in selected_passage_ids
             if bid in block_map
         ]
         req_inputs = [
@@ -595,14 +668,16 @@ def audit_holistic_set(
                 group_id=group.group_id,
                 topic_keywords=list(group.topic_keywords),
                 criteria_catalog=[c.value for c in _WHOLE_SET_ORDERED],
-                inspected_block_ids=scope_blocks if group.group_id == "whole-spec" else group_inspected,
-                has_uninspected_scope=has_uninspected_scope,
+                inspected_block_ids=selected_passage_ids,
+                has_uninspected_scope=group_has_uninspected_scope,
                 requirements=req_inputs,
                 passages=passages,
                 repair_hint=repair_hint,
             )
 
         payload = _make_payload()
+        est_in = _estimate_tokens(payload.model_dump_json())
+        est_out = 1800
         stage_result: StageResult[HolisticAuditOutput] | None = None
         stop_all = False
 
@@ -613,6 +688,8 @@ def audit_holistic_set(
                     payload,
                     settings=settings,
                     budget=budget,
+                    estimated_input_tokens=est_in,
+                    estimated_output_tokens=est_out,
                 )
                 total_attempts += stage_result.attempts
                 if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
@@ -625,6 +702,14 @@ def audit_holistic_set(
                 if exc.action == FailureAction.REPAIR and repair_attempt == 0:
                     payload = _make_payload(repair_hint=HOLISTIC_REPAIR_HINT)
                     continue
+                if exc.action == FailureAction.SPLIT:
+                    sub_groups = _split_group(group, req_map, block_order)
+                    if sub_groups is not None:
+                        planned_groups.extend(sg.group_id for sg in sub_groups)
+                        queue[q_idx:q_idx] = sub_groups
+                        completed_groups.append(group.group_id)
+                        stage_result = None
+                        break
                 incomplete_reasons.append(f"Группа {group.group_id} целостного аудита не завершена: {exc}.")
                 if exc.reason in _STOP_ALL_REASONS:
                     stop_all = True
@@ -637,11 +722,10 @@ def audit_holistic_set(
 
         output = stage_result.output
         group_clean = True
-        local_key_to_temp_id: dict[str, str] = {}
-        local_findings_by_key: dict[str, Finding] = {}
+        local_key_to_draft: dict[str, _DraftHolisticFinding] = {}
 
         for fc in output.findings:
-            if fc.local_key in local_key_to_temp_id:
+            if fc.local_key in local_key_to_draft:
                 incomplete_reasons.append(f"Группа {group.group_id}: дубликат local_key {fc.local_key}.")
                 group_clean = False
                 continue
@@ -649,8 +733,8 @@ def audit_holistic_set(
                 fc,
                 document,
                 valid_req_ids,
-                effective_inspected,
-                has_uninspected_scope,
+                group_inspected_set,
+                group_has_uninspected_scope,
                 ground_fn,
             )
             if uncertainty_note:
@@ -658,24 +742,7 @@ def audit_holistic_set(
             if rejection or draft is None:
                 uncertainties.append(rejection or f"Группа {group.group_id}: отклонена находка {fc.local_key}.")
                 continue
-            temp_finding_seq += 1
-            temp_id = f"TMP-{temp_finding_seq:04d}"
-            finding = Finding(
-                finding_id=temp_id,
-                kind=draft.kind,
-                severity=draft.severity,
-                claim=draft.claim,
-                recommendation=draft.recommendation,
-                requirement_ids=draft.requirement_ids,
-                criteria=sorted(draft.criteria, key=lambda c: c.value),
-                evidence=draft.evidence,
-                gap=draft.gap,
-                semantic_status=draft.semantic_status,
-                verification_reason=draft.verification_reason,
-            )
-            local_key_to_temp_id[fc.local_key] = temp_id
-            local_findings_by_key[fc.local_key] = finding
-            raw_findings.append(finding)
+            local_key_to_draft[fc.local_key] = draft
 
         seen_group_criteria: dict[QualityCriterion, HolisticCriterionCandidate] = {}
         for ev in output.evaluations:
@@ -706,23 +773,48 @@ def audit_holistic_set(
             )
             group_clean = False
 
+        # Synchronize finding criteria strictly with the FAIL evaluations citing each finding,
+        # and exclude unreferenced orphan findings so ValidationReport's cited == declared invariant holds.
+        cited_criteria_by_key: dict[str, set[QualityCriterion]] = defaultdict(set)
+        for crit, ev in seen_group_criteria.items():
+            if ev.status != CriterionStatus.FAIL:
+                continue
+            for k in ev.local_finding_keys:
+                if k in local_key_to_draft:
+                    cited_criteria_by_key[k].add(crit)
+
+        local_key_to_temp_id: dict[str, str] = {}
+        for key, draft in local_key_to_draft.items():
+            synced_criteria = cited_criteria_by_key.get(key)
+            if not synced_criteria:
+                uncertainties.append(
+                    f"Группа {group.group_id}: находка {key} не привязана ни к одному критерию со статусом fail и исключена."
+                )
+                continue
+            temp_finding_seq += 1
+            temp_id = f"TMP-{temp_finding_seq:04d}"
+            finding = Finding(
+                finding_id=temp_id,
+                kind=draft.kind,
+                severity=draft.severity,
+                claim=draft.claim,
+                recommendation=draft.recommendation,
+                requirement_ids=draft.requirement_ids,
+                criteria=sorted(synced_criteria, key=lambda c: c.value),
+                evidence=draft.evidence,
+                gap=draft.gap,
+                semantic_status=draft.semantic_status,
+                verification_reason=draft.verification_reason,
+            )
+            local_key_to_temp_id[key] = temp_id
+            raw_findings.append(finding)
+
         for crit, ev in seen_group_criteria.items():
             resolved_ids = [
                 local_key_to_temp_id[k]
                 for k in ev.local_finding_keys
                 if k in local_key_to_temp_id
             ]
-            # Ensure every linked finding declares this criterion.
-            for k in ev.local_finding_keys:
-                f = local_findings_by_key.get(k)
-                if f is not None and crit not in f.criteria:
-                    idx_f = raw_findings.index(f)
-                    updated = f.model_copy(
-                        update={"criteria": sorted({*f.criteria, crit}, key=lambda c: c.value)}
-                    )
-                    raw_findings[idx_f] = updated
-                    local_findings_by_key[k] = updated
-
             if ev.status == CriterionStatus.FAIL and not resolved_ids:
                 # Candidate defect was rejected (e.g. missing 2nd quote) -> cannot keep unsupported FAIL.
                 criterion_observations[crit].append(

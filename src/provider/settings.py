@@ -12,4 +12,8 @@ def load_settings(env_file: Path | None = None) -> ProviderSettings:
     api_key = (os.environ.get("GEMINI_API_KEY") or os.environ.get("GOOGLE_API_KEY")
                or values.get("GEMINI_API_KEY") or values.get("GOOGLE_API_KEY"))
     model = os.environ.get("GEMINI_MODEL") or values.get("GEMINI_MODEL")
+    if api_key and not api_key.strip():
+        raise ValueError("Empty provider credential")
+    if model and not model.strip():
+        raise ValueError("Empty provider model")
     return ProviderSettings(api_key=api_key, **({"model": model} if model else {}))

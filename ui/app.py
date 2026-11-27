@@ -11,13 +11,12 @@ from ui.clarification import render_clarification
 
 st.set_page_config(
     page_title="Агент проверки требований · BCC-HUB × MNU",
-    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
 dashboard.inject_theme()
-dashboard.render_header()
+header_slot = st.empty()
 
 mode = st.radio(
     "Рабочий режим",
@@ -27,6 +26,11 @@ mode = st.radio(
 )
 saved = mode == "Сохранённый отчёт"
 report = dashboard.open_saved() if saved else dashboard.analyze()
+
+with header_slot.container():
+    active_step = 1 if report is None else (5 if report.questions else 6)
+    dashboard.render_header(active_step=active_step)
+
 if report is not None:
     dashboard.show_report(report, saved=saved)
     base = dashboard.load_settings()

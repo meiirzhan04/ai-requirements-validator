@@ -1,8 +1,10 @@
 """Parse shareable source bytes locally into versioned, addressable blocks."""
+from collections import OrderedDict
 import hashlib
 from pathlib import Path
 import re
 from statistics import median
+import threading
 
 import pymupdf
 
@@ -11,6 +13,9 @@ from src.contracts import DocumentFormat, DocumentVersion, ParsedDocument, Sourc
 MAX_BYTES = 10 * 1024 * 1024
 MAX_PAGES = 100
 PARSER_VERSION = "ingest-1"
+_PARSE_CACHE_MAX = 8
+_PARSE_CACHE_LOCK = threading.Lock()
+_PARSE_CACHE: OrderedDict[tuple[str, str, str], ParsedDocument] = OrderedDict()
 _HEADING = re.compile(r"^ {0,3}#{1,6}(?:[ \t]+(.*?)|[ \t]*)$")
 _FENCE = re.compile(r"^ {0,3}(\x60{3,}|~{3,})")
 _SETEXT = re.compile(r"^ {0,3}(?:=+|-+)[ \t]*$")
@@ -182,9 +187,19 @@ def parse(name: str, data: bytes) -> ParsedDocument:
     if not data or len(data) > MAX_BYTES:
         raise ValueError("Файл пуст или превышает предел 10 МиБ.")
     suffix = Path(name).suffix.lower()
+    if suffix not in (".md", ".pdf"):
+        raise ValueError("Поддерживаются только файлы .md и .pdf.")
     digest = hashlib.sha256(data).hexdigest()
-    if suffix == ".md":
-        return _markdown(name, data, digest)
-    if suffix == ".pdf":
-        return _pdf(name, data, digest)
-    raise ValueError("Поддерживаются только файлы .md и .pdf.")
+    cache_key = (name, digest, PARSER_VERSION)
+    with _PARSE_CACHE_LOCK:
+        cached = _PARSE_CACHE.get(cache_key)
+        if cached is not None:
+            _PARSE_CACHE.move_to_end(cache_key)
+            return cached.model_copy(deep=True)
+    parsed = _markdown(name, data, digest) if suffix == ".md" else _pdf(name, data, digest)
+    with _PARSE_CACHE_LOCK:
+        _PARSE_CACHE[cache_key] = parsed
+        _PARSE_CACHE.move_to_end(cache_key)
+        while len(_PARSE_CACHE) > _PARSE_CACHE_MAX:
+            _PARSE_CACHE.popitem(last=False)
+    return parsed.model_copy(deep=True)

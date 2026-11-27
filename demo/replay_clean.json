@@ -1,17 +1,17 @@
 {
   "schema_version": "1",
   "metadata": {
-    "run_id": "run-c409da6fd9df",
+    "run_id": "run-f72385bab960",
     "document_version": "2c319e36fa5dcd529cfe60d21e890e98700a2006cbb4573e9200931462eb26bf",
-    "started_at": "2026-11-27T07:33:02.275403Z",
+    "started_at": "2026-11-27T09:39:22.656771Z",
     "model": "gemini-3.5-flash-lite",
-    "agent_revision": "4337c57",
-    "prompt_version": "pipeline-v1",
+    "agent_revision": "7b9ec33",
+    "prompt_version": "pipeline-v2",
     "origin": "live",
-    "duration_seconds": 9.0,
+    "duration_seconds": 6.656,
     "request_attempts": 3,
-    "input_tokens": 2984,
-    "output_tokens": 2506
+    "input_tokens": 3124,
+    "output_tokens": 3207
   },
   "document": {
     "version": {
@@ -67,7 +67,7 @@
       "req_id": "R001",
       "original_id": "R1",
       "category": "functional",
-      "summary": "Когда список участников пуст, кнопка «Экспорт» недоступна.",
+      "summary": "Когда список участников пуст, кнопка «Экспорт» должна быть недоступна.",
       "source": {
         "version": "2c319e36fa5dcd529cfe60d21e890e98700a2006cbb4573e9200931462eb26bf",
         "block_id": "B00002",
@@ -81,7 +81,7 @@
       "req_id": "R002",
       "original_id": "R2",
       "category": "functional",
-      "summary": "Когда список участников содержит хотя бы одну запись, кнопка «Экспорт» доступна.",
+      "summary": "Когда список участников содержит хотя бы одну запись, кнопка «Экспорт» должна быть доступна.",
       "source": {
         "version": "2c319e36fa5dcd529cfe60d21e890e98700a2006cbb4573e9200931462eb26bf",
         "block_id": "B00003",
@@ -97,91 +97,91 @@
       "requirement_id": "R001",
       "criterion": "29148.5.2.5.appropriate",
       "status": "pass",
-      "rationale": "Требование описывает поведение системы на правильном уровне абстракции без деталей реализации.",
+      "rationale": "Формулировка на уровне требований к ПО подходит.",
       "finding_ids": []
     },
     {
       "requirement_id": "R001",
       "criterion": "29148.5.2.5.complete",
       "status": "pass",
-      "rationale": "Требование содержит условие (список участников пуст) и результат (кнопка 'Экспорт' недоступна).",
+      "rationale": "Вся необходимая информация для данного сценария присутствует.",
       "finding_ids": []
     },
     {
       "requirement_id": "R001",
       "criterion": "29148.5.2.5.conforming",
-      "status": "not_applicable",
-      "rationale": "Специфические шаблоны документов или стандарты оформления для данного требования не заданы.",
+      "status": "unknown",
+      "rationale": "Отсутствует корпоративный шаблон требований для проверки соответствия.",
       "finding_ids": []
     },
     {
       "requirement_id": "R001",
       "criterion": "29148.5.2.5.correct",
-      "status": "unknown",
-      "rationale": "Невозможно проверить корректность без внешнего регламента или требований к интерфейсу.",
+      "status": "pass",
+      "rationale": "Корректно описывает функциональное поведение.",
       "finding_ids": []
     },
     {
       "requirement_id": "R001",
       "criterion": "29148.5.2.5.feasible",
       "status": "pass",
-      "rationale": "Реализация доступности кнопки интерфейса технически достижима.",
+      "rationale": "Реализация доступности элементов интерфейса технически осуществима.",
       "finding_ids": []
     },
     {
       "requirement_id": "R001",
       "criterion": "29148.5.2.5.necessary",
       "status": "pass",
-      "rationale": "Требование определяет логику доступности элемента управления интерфейса в зависимости от состояния данных.",
+      "rationale": "Требование необходимо для реализации интерфейса пустого списка участников.",
       "finding_ids": []
     },
     {
       "requirement_id": "R001",
       "criterion": "29148.5.2.5.singular",
       "status": "pass",
-      "rationale": "Требование выражает одно атомарное правило.",
+      "rationale": "Требование выражает одно атомарное условие.",
       "finding_ids": []
     },
     {
       "requirement_id": "R001",
       "criterion": "29148.5.2.5.unambiguous",
       "status": "pass",
-      "rationale": "Формулировка однозначна и не содержит расплывчатых терминов.",
+      "rationale": "Условия и поведение кнопки определены однозначно.",
       "finding_ids": []
     },
     {
       "requirement_id": "R001",
       "criterion": "29148.5.2.5.verifiable",
       "status": "pass",
-      "rationale": "Условие проверяемо: при пустом списке кнопка должна быть неактивна.",
+      "rationale": "Состояние кнопки при пустом списке проверяемо.",
       "finding_ids": []
     },
     {
       "requirement_id": "R002",
       "criterion": "29148.5.2.5.appropriate",
       "status": "pass",
-      "rationale": "Сформулировано на правильном уровне абстракции.",
+      "rationale": "Формулировка подходит для системных требований.",
       "finding_ids": []
     },
     {
       "requirement_id": "R002",
       "criterion": "29148.5.2.5.complete",
       "status": "pass",
-      "rationale": "Содержит условие и следствие.",
+      "rationale": "Вся необходимая информация присутствует.",
       "finding_ids": []
     },
     {
       "requirement_id": "R002",
       "criterion": "29148.5.2.5.conforming",
-      "status": "not_applicable",
-      "rationale": "Требования к оформлению не объявлены.",
+      "status": "unknown",
+      "rationale": "Отсутствует корпоративный шаблон требований для проверки соответствия.",
       "finding_ids": []
     },
     {
       "requirement_id": "R002",
       "criterion": "29148.5.2.5.correct",
-      "status": "unknown",
-      "rationale": "Отсутствует внешнее описание бизнес-логики интерфейса.",
+      "status": "pass",
+      "rationale": "Логика корректна.",
       "finding_ids": []
     },
     {
@@ -195,119 +195,119 @@
       "requirement_id": "R002",
       "criterion": "29148.5.2.5.necessary",
       "status": "pass",
-      "rationale": "Требование определяет необходимую функциональность интерфейса.",
+      "rationale": "Требование необходимо для реализации интерфейса непустого списка.",
       "finding_ids": []
     },
     {
       "requirement_id": "R002",
       "criterion": "29148.5.2.5.singular",
       "status": "pass",
-      "rationale": "Выражает одно правило.",
+      "rationale": "Содержит одно атомарное правило.",
       "finding_ids": []
     },
     {
       "requirement_id": "R002",
       "criterion": "29148.5.2.5.unambiguous",
       "status": "pass",
-      "rationale": "Интерпретация однозначна.",
+      "rationale": "Условия активации кнопки описаны однозначно.",
       "finding_ids": []
     },
     {
       "requirement_id": "R002",
       "criterion": "29148.5.2.5.verifiable",
       "status": "pass",
-      "rationale": "Проверяется наличием записей и состоянием кнопки.",
+      "rationale": "Состояние кнопки проверяемо.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "29148.5.2.6.complete",
       "status": "pass",
-      "rationale": "Требования охватывают базовые состояния доступности кнопки экспорта для пустого и непустого списков.",
+      "rationale": "Требования охватывают все возможные состояния списка участников (пустой и непустой) для доступности кнопки экспорта.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "29148.5.2.6.comprehensible",
       "status": "pass",
-      "rationale": "Формулировки требований ясны и понятны для всех участников процесса.",
+      "rationale": "Формулировки требований ясны и понятны.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "29148.5.2.6.consistent",
       "status": "pass",
-      "rationale": "Противоречия между требованиями отсутствуют, условия взаимно исключающие и охватывают все варианты.",
+      "rationale": "Противоречия между требованиями отсутствуют, логика состояний едина.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "29148.5.2.6.feasible",
       "status": "pass",
-      "rationale": "Реализация доступности кнопки в зависимости от наличия записей в списке технически осуществима.",
+      "rationale": "Требования технически реализуемы.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "29148.5.2.6.validatable",
       "status": "pass",
-      "rationale": "Условия проверки легко проверяются путем тестирования интерфейса с пустым и заполненным списками.",
+      "rationale": "Условия и результаты проверки четко определены.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "830.4.3.complete",
       "status": "pass",
-      "rationale": "Набор требований полон для текущей описанной функции экспорта.",
+      "rationale": "Набор требований положен в основу функционала экспорта без пропусков базовых состояний.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "830.4.3.consistent",
       "status": "pass",
-      "rationale": "Требования согласованы между собой и не содержат логических конфликтов.",
+      "rationale": "Конфликты в спецификации не обнаружены.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "830.4.3.correct",
       "status": "pass",
-      "rationale": "Требования корректно отражают логику работы интерфейса.",
+      "rationale": "Требования корректно описывают поведение интерфейса.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "830.4.3.modifiable",
       "status": "pass",
-      "rationale": "Каждое требование записано отдельно, что упрощает их модификацию.",
+      "rationale": "Каждое требование изолировано и легко модифицируемо.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "830.4.3.ranked",
-      "status": "not_applicable",
-      "rationale": "В спецификации не заданы приоритеты требований, так как объем функционала минимален.",
+      "status": "pass",
+      "rationale": "Небольшой набор базовых требований логически понятен и не требует сложной приоритезации.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "830.4.3.traceable",
       "status": "pass",
-      "rationale": "Каждое требование имеет уникальный идентификатор для прослеживаемости.",
+      "rationale": "Требования имеют уникальные идентификаторы R1 и R2.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "830.4.3.unambiguous",
       "status": "pass",
-      "rationale": "Формулировки не допускают двоякого толкования.",
+      "rationale": "Двоякое толкование формулировок исключено.",
       "finding_ids": []
     },
     {
       "requirement_id": null,
       "criterion": "830.4.3.verifiable",
       "status": "pass",
-      "rationale": "Требования проверяемы эмпирически через пользовательский интерфейс.",
+      "rationale": "Состояния проверяемы стандартными методами тестирования.",
       "finding_ids": []
     }
   ],
@@ -327,7 +327,7 @@
       ]
     },
     "context_blocks": {
-      "B00001": "Заголовок раздела, не содержит нормативных требований."
+      "B00001": "Заголовок раздела"
     },
     "individual_requirements": {
       "planned": [

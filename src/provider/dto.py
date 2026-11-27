@@ -1,7 +1,45 @@
 """Provider-facing data only. No canonical IDs, totals or readiness decisions."""
-from typing import Literal
-from pydantic import BaseModel, Field
+from typing import Annotated, Literal
+from pydantic import AfterValidator, BaseModel, Field
 from src.contracts import CriterionStatus, FindingType, QualityCriterion, QuestionPriority, RequirementCategory, Severity, StakeholderRole
+
+def _to_quality_criterion(value: str) -> QualityCriterion:
+    return QualityCriterion(value)
+
+
+IndividualCriterionValue = Annotated[
+    Literal[
+        "29148.5.2.5.necessary",
+        "29148.5.2.5.appropriate",
+        "29148.5.2.5.unambiguous",
+        "29148.5.2.5.complete",
+        "29148.5.2.5.singular",
+        "29148.5.2.5.feasible",
+        "29148.5.2.5.verifiable",
+        "29148.5.2.5.correct",
+        "29148.5.2.5.conforming",
+    ],
+    AfterValidator(_to_quality_criterion),
+]
+
+WholeSetCriterionValue = Annotated[
+    Literal[
+        "29148.5.2.6.complete",
+        "29148.5.2.6.consistent",
+        "29148.5.2.6.feasible",
+        "29148.5.2.6.comprehensible",
+        "29148.5.2.6.validatable",
+        "830.4.3.correct",
+        "830.4.3.unambiguous",
+        "830.4.3.complete",
+        "830.4.3.consistent",
+        "830.4.3.ranked",
+        "830.4.3.verifiable",
+        "830.4.3.modifiable",
+        "830.4.3.traceable",
+    ],
+    AfterValidator(_to_quality_criterion),
+]
 
 
 class ProbeRequest(BaseModel):
@@ -78,7 +116,7 @@ class IndividualAuditPayload(BaseModel):
 
 class IndividualCriterionCandidate(BaseModel):
     requirement_id: str
-    criterion: QualityCriterion
+    criterion: IndividualCriterionValue
     status: CriterionStatus
     rationale: str
     local_finding_keys: list[str] = Field(default_factory=list)
@@ -96,7 +134,7 @@ class IndividualFindingCandidate(BaseModel):
     severity: Severity
     claim: str
     recommendation: str
-    criteria: list[QualityCriterion] = Field(min_length=1)
+    criteria: list[IndividualCriterionValue] = Field(min_length=1)
     evidence: list[IndividualEvidenceQuote] = Field(min_length=1)
     expected_information: str | None = None
 
@@ -130,6 +168,7 @@ class HolisticGroupPayload(BaseModel):
     criteria_catalog: list[str]
     inspected_block_ids: list[str]
     has_uninspected_scope: bool = False
+    structural_signals: list[str] = Field(default_factory=list)
     requirements: list[HolisticRequirementInput]
     passages: list[HolisticPassageInput]
     repair_hint: str | None = None
@@ -149,7 +188,7 @@ class HolisticFindingCandidate(BaseModel):
     conditions: str | None = None
     recommendation: str
     requirement_ids: list[str] = Field(default_factory=list)
-    criteria: list[QualityCriterion] = Field(min_length=1)
+    criteria: list[WholeSetCriterionValue] = Field(min_length=1)
     evidence: list[HolisticEvidenceQuote] = Field(default_factory=list)
     expected_information: str | None = None
     gap_context: HolisticEvidenceQuote | None = None
@@ -157,7 +196,7 @@ class HolisticFindingCandidate(BaseModel):
 
 
 class HolisticCriterionCandidate(BaseModel):
-    criterion: QualityCriterion
+    criterion: WholeSetCriterionValue
     status: CriterionStatus
     rationale: str
     local_finding_keys: list[str] = Field(default_factory=list)

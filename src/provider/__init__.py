@@ -1,5 +1,9 @@
 """Single Gemini transport entry point for pipeline and clarification stages."""
-from typing import TypeVar
+from collections.abc import Iterator
+from contextlib import contextmanager
+from functools import lru_cache
+import threading
+from typing import Any, TypeVar
 
 from google import genai
 from google.genai import errors, types
@@ -19,6 +23,10 @@ from .settings import load_settings
 
 Output = TypeVar("Output", bound=BaseModel)
 
+_REAL_GENAI_CLIENT = genai.Client
+_SESSION_LOCK = threading.RLock()
+_ACTIVE_SESSIONS: list[tuple[str, Any]] = []
+
 __all__ = [
     "FailureAction",
     "FailureReason",
@@ -26,7 +34,66 @@ __all__ = [
     "QuotaBudget",
     "generate",
     "load_settings",
+    "provider_session",
 ]
+
+
+@lru_cache(maxsize=32)
+def _cached_json_schema(model_cls: type[BaseModel]) -> dict[str, Any]:
+    return model_cls.model_json_schema()
+
+
+@contextmanager
+def provider_session(settings: ProviderSettings) -> Iterator[None]:
+    """Reuse one thread-safe google-genai Client across a pipeline run for HTTP keep-alive pooling."""
+    if not settings.api_key or genai.Client is not _REAL_GENAI_CLIENT:
+        yield
+        return
+    secret = settings.api_key.get_secret_value()
+    http = types.HttpOptions(
+        timeout=settings.timeout_ms,
+        retry_options=types.HttpRetryOptions(attempts=1),
+    )
+    entry: tuple[str, Any] | None = None
+    with genai.Client(api_key=secret, http_options=http) as client:
+        entry = (secret, client)
+        with _SESSION_LOCK:
+            _ACTIVE_SESSIONS.append(entry)
+        try:
+            yield
+        finally:
+            with _SESSION_LOCK:
+                if entry in _ACTIVE_SESSIONS:
+                    _ACTIVE_SESSIONS.remove(entry)
+
+
+def _lookup_session_client(secret: str) -> Any | None:
+    if genai.Client is not _REAL_GENAI_CLIENT:
+        return None
+    with _SESSION_LOCK:
+        for entry_secret, client in reversed(_ACTIVE_SESSIONS):
+            if entry_secret == secret:
+                return client
+    return None
+
+
+_THINKING_BUDGET_BY_STAGE: dict[PipelineStage, int] = {
+    PipelineStage.HOLISTIC: 4096,
+    PipelineStage.VERIFY: 2048,
+}
+
+
+def _supports_thinking_budget(model: str) -> bool:
+    lowered = model.lower()
+    return "gemini-3" in lowered or "gemini-2.5" in lowered
+
+
+def _prepare_request(payload: BaseModel) -> tuple[str | None, str]:
+    """Separate trusted system instructions from untrusted JSON payload when present."""
+    raw_sys = getattr(payload, "system_instruction", None)
+    if isinstance(raw_sys, str) and raw_sys.strip() and "system_instruction" in type(payload).model_fields:
+        return raw_sys, payload.model_dump_json(exclude={"system_instruction"}, exclude_none=True)
+    return None, payload.model_dump_json(exclude_none=True)
 
 
 def generate(
@@ -40,7 +107,7 @@ def generate(
     estimated_input_tokens: int = 0,
     estimated_output_tokens: int = 0,
 ) -> StageResult[Output]:
-    """Perform a structured Gemini request with bounded retries and quota accounting."""
+    """Perform a structured Gemini request with bounded retries, pooling, and quota accounting."""
     settings = settings or load_settings()
     if not settings.api_key:
         raise ProviderError(
@@ -60,8 +127,9 @@ def generate(
         else (1 if stage == PipelineStage.SMOKE else active_budget.max_attempts_per_call)
     )
     estimated_tokens = max(0, estimated_input_tokens) + max(0, estimated_output_tokens)
-    serialized_payload = payload.model_dump_json()
-    schema = output_type.model_json_schema()
+    system_instruction, serialized_payload = _prepare_request(payload)
+    schema = _cached_json_schema(output_type)
+    secret = settings.api_key.get_secret_value()
 
     call_attempts = 0
     while True:
@@ -79,16 +147,34 @@ def generate(
             timeout=timeout_ms,
             retry_options=types.HttpRetryOptions(attempts=1),
         )
+        config_kwargs: dict[str, Any] = {
+            "response_mime_type": "application/json",
+            "response_json_schema": schema,
+            "temperature": 0.0,
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
+        }
+        thinking_budget = _THINKING_BUDGET_BY_STAGE.get(stage)
+        if thinking_budget is not None and _supports_thinking_budget(settings.model):
+            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+        if system_instruction is not None:
+            config_kwargs["system_instruction"] = system_instruction
+
         try:
-            with genai.Client(api_key=settings.api_key.get_secret_value(), http_options=http) as client:
-                response = client.models.generate_content(
+            shared_client = _lookup_session_client(secret)
+            if shared_client is not None:
+                config_kwargs["http_options"] = http
+                response = shared_client.models.generate_content(
                     model=settings.model,
                     contents=serialized_payload,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json",
-                        response_json_schema=schema,
-                    ),
+                    config=types.GenerateContentConfig(**config_kwargs),
                 )
+            else:
+                with genai.Client(api_key=secret, http_options=http) as client:
+                    response = client.models.generate_content(
+                        model=settings.model,
+                        contents=serialized_payload,
+                        config=types.GenerateContentConfig(**config_kwargs),
+                    )
         except errors.APIError as exc:
             active_budget.record_unknown_usage()
             err = classify_api_error(exc, attempts=call_attempts)

@@ -19,7 +19,10 @@ class ExtractionScope(Contract):
     incomplete_reasons: list[Text]
 
 
-_PLACEHOLDER = re.compile(r"(?<!\w)(?:TBD|TBC|TODO|FIXME|уточнить|будет уточнено)(?!\w)|\?{3,}", re.I)
+_PLACEHOLDER = re.compile(
+    r"(?<!\w)(?:TBD|TBC|TODO|FIXME|уточнить|будет\s+уточнено|заполня(?:ется|ются)\s+\S+|не\s+заполнен[оаы]?)(?!\w)|\?{3,}",
+    re.I,
+)
 _FIELD = re.compile(r"^\s*(?:[-*+]\s+)?[\w][^|:\r\n]{0,100}[:：]\s*$")
 _HEADING = re.compile(r"^ {0,3}(#{1,6})(?:\s+.*)?$")
 _FENCE = re.compile(r"^ {0,3}(?:\x60{3,}|~{3,})")

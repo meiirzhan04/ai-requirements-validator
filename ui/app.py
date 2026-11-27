@@ -9,10 +9,22 @@ from src.contracts import ProviderSettings
 from ui import dashboard
 from ui.clarification import render_clarification
 
-st.set_page_config(page_title="Аудит требований", layout="wide")
-st.title("Аудит требований")
-mode = st.radio("Рабочий режим", ["Анализ документа", "Сохранённый отчёт"],
-                horizontal=True, label_visibility="collapsed")
+st.set_page_config(
+    page_title="Агент проверки требований · BCC-HUB × MNU",
+    page_icon="🛡️",
+    layout="wide",
+    initial_sidebar_state="collapsed",
+)
+
+dashboard.inject_theme()
+dashboard.render_header()
+
+mode = st.radio(
+    "Рабочий режим",
+    ["Анализ документа", "Сохранённый отчёт"],
+    horizontal=True,
+    label_visibility="collapsed",
+)
 saved = mode == "Сохранённый отчёт"
 report = dashboard.open_saved() if saved else dashboard.analyze()
 if report is not None:
@@ -20,4 +32,7 @@ if report is not None:
     base = dashboard.load_settings()
     model = str(st.session_state.get("model", base.model)).strip() or base.model
     timeout = int(st.session_state.get("timeout_ms", base.timeout_ms))
-    render_clarification(report, ProviderSettings(api_key=base.api_key, model=model, timeout_ms=timeout))
+    render_clarification(
+        report,
+        ProviderSettings(api_key=base.api_key, model=model, timeout_ms=timeout),
+    )

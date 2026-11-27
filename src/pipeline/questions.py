@@ -1,5 +1,6 @@
 """Targeted stakeholder clarification question engine built on validated findings."""
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 import inspect
 import re
 
@@ -161,6 +162,72 @@ def _call_provider(
     )
 
 
+def _execute_question_batch(
+    *,
+    batch_id: str,
+    batch: list[Finding],
+    document: ParsedDocument,
+    settings: ProviderSettings,
+    budget: QuotaBudget | None,
+    generate_fn: GenerateFn,
+) -> tuple[StageResult[QuestionGenerationOutput] | None, ProviderError | None, int]:
+    finding_inputs = [
+        QuestionFindingInput(
+            finding_id=f.finding_id,
+            kind=f.kind.value,
+            severity=f.severity.value,
+            semantic_status=f.semantic_status.value,
+            claim=f.claim,
+            recommendation=f.recommendation,
+            requirement_ids=list(f.requirement_ids),
+            evidence=[
+                QuestionFindingEvidenceInput(
+                    block_id=ref.block_id,
+                    start=ref.start,
+                    end=ref.end,
+                    quote=ref.quote,
+                )
+                for ref in _finding_grounded_evidence(f)
+            ],
+        )
+        for f in batch
+    ]
+
+    def _make_payload(repair_hint: str | None = None) -> QuestionGenerationPayload:
+        return QuestionGenerationPayload(
+            system_instruction=QUESTIONS_SYSTEM_PROMPT,
+            prompt_version=QUESTIONS_PROMPT_VERSION,
+            document_name=document.version.name,
+            batch_id=batch_id,
+            findings=finding_inputs,
+            repair_hint=repair_hint,
+        )
+
+    payload = _make_payload()
+    est_in = _estimate_tokens(payload.model_dump_json(exclude={"system_instruction"}, exclude_none=True))
+    est_out = len(batch) * 220
+    attempts = 0
+    for repair_attempt in range(2):
+        try:
+            stage_result = _call_provider(
+                generate_fn,
+                payload,
+                settings=settings,
+                budget=budget,
+                estimated_input_tokens=est_in,
+                estimated_output_tokens=est_out,
+            )
+            attempts += stage_result.attempts
+            return stage_result, None, attempts
+        except ProviderError as exc:
+            attempts += max(exc.attempts, 0)
+            if exc.action == FailureAction.REPAIR and repair_attempt == 0:
+                payload = _make_payload(repair_hint=QUESTIONS_REPAIR_HINT)
+                continue
+            return None, exc, attempts
+    return None, None, attempts
+
+
 def generate_questions(
     findings: list[Finding],
     document: ParsedDocument,
@@ -169,7 +236,8 @@ def generate_questions(
     budget: QuotaBudget | None = None,
     generate_fn: GenerateFn = generate,
     include_minor: bool = False,
-    batch_size: int = 8,
+    batch_size: int = 16,
+    max_concurrency: int = 1,
 ) -> QuestionGenerationResult:
     """Generate stakeholder clarification questions grounded strictly in material findings."""
     findings_by_id = {f.finding_id: f for f in findings}
@@ -199,97 +267,16 @@ def generate_questions(
     known_in = 0
     known_out = 0
     has_known_usage = False
+    workers = max(1, max_concurrency)
 
     step = max(1, batch_size)
-    queue: list[tuple[str, list[Finding]]] = [
+    pending_wave: list[tuple[str, list[Finding]]] = [
         (f"clarify-{batch_num}", eligible[offset : offset + step])
         for batch_num, offset in enumerate(range(0, len(eligible), step), start=1)
     ]
 
-    q_idx = 0
-    while q_idx < len(queue):
-        batch_id, batch = queue[q_idx]
-        q_idx += 1
+    def _consume_questions(batch_id: str, batch: list[Finding], output: QuestionGenerationOutput) -> None:
         batch_fids = {f.finding_id for f in batch}
-
-        finding_inputs = [
-            QuestionFindingInput(
-                finding_id=f.finding_id,
-                kind=f.kind.value,
-                severity=f.severity.value,
-                semantic_status=f.semantic_status.value,
-                claim=f.claim,
-                recommendation=f.recommendation,
-                requirement_ids=list(f.requirement_ids),
-                evidence=[
-                    QuestionFindingEvidenceInput(
-                        block_id=ref.block_id,
-                        start=ref.start,
-                        end=ref.end,
-                        quote=ref.quote,
-                    )
-                    for ref in _finding_grounded_evidence(f)
-                ],
-            )
-            for f in batch
-        ]
-
-        def _make_payload(repair_hint: str | None = None) -> QuestionGenerationPayload:
-            return QuestionGenerationPayload(
-                system_instruction=QUESTIONS_SYSTEM_PROMPT,
-                prompt_version=QUESTIONS_PROMPT_VERSION,
-                document_name=document.version.name,
-                batch_id=batch_id,
-                findings=finding_inputs,
-                repair_hint=repair_hint,
-            )
-
-        payload = _make_payload()
-        est_in = _estimate_tokens(payload.model_dump_json())
-        est_out = len(batch) * 260
-        stage_result: StageResult[QuestionGenerationOutput] | None = None
-        stop_all = False
-
-        for repair_attempt in range(2):
-            try:
-                stage_result = _call_provider(
-                    generate_fn,
-                    payload,
-                    settings=settings,
-                    budget=budget,
-                    estimated_input_tokens=est_in,
-                    estimated_output_tokens=est_out,
-                )
-                total_attempts += stage_result.attempts
-                if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
-                    known_in += stage_result.input_tokens
-                    known_out += stage_result.output_tokens
-                    has_known_usage = True
-                break
-            except ProviderError as exc:
-                total_attempts += max(exc.attempts, 0)
-                if exc.action == FailureAction.REPAIR and repair_attempt == 0:
-                    payload = _make_payload(repair_hint=QUESTIONS_REPAIR_HINT)
-                    continue
-                if exc.action == FailureAction.SPLIT and len(batch) > 1:
-                    mid = len(batch) // 2
-                    queue[q_idx:q_idx] = [
-                        (f"{batch_id}.1", batch[:mid]),
-                        (f"{batch_id}.2", batch[mid:]),
-                    ]
-                    stage_result = None
-                    break
-                incomplete_reasons.append(f"Пакет генерации вопросов {batch_id} не завершён: {exc}.")
-                if exc.reason in _STOP_ALL_REASONS:
-                    stop_all = True
-                break
-
-        if stop_all:
-            break
-        if stage_result is None:
-            continue
-
-        output = stage_result.output
         for skipped in output.skipped_findings:
             if skipped.finding_id in batch_fids and skipped.finding_id not in skipped_finding_ids:
                 skipped_finding_ids.append(skipped.finding_id)
@@ -325,7 +312,6 @@ def generate_questions(
                 )
                 continue
 
-            # Collect strictly grounded evidence anchors belonging to the linked findings.
             allowed_evidence: list[EvidenceRef] = []
             seen_anchors: set[tuple[str, str, int, int]] = set()
             for f in related:
@@ -354,7 +340,6 @@ def generate_questions(
                 )
                 continue
 
-            # Restrict requirement_ids strictly to requirements belonging to linked findings.
             allowed_reqs = list(dict.fromkeys(r for f in related for r in f.requirement_ids))
             allowed_req_set = set(allowed_reqs)
             if cand.requirement_ids:
@@ -400,6 +385,86 @@ def generate_questions(
                     },
                 )
             )
+
+    stop_all = False
+    while pending_wave and not stop_all:
+        if workers <= 1 or len(pending_wave) <= 1:
+            q_idx = 0
+            while q_idx < len(pending_wave):
+                batch_id, batch = pending_wave[q_idx]
+                q_idx += 1
+                stage_result, exc, batch_attempts = _execute_question_batch(
+                    batch_id=batch_id,
+                    batch=batch,
+                    document=document,
+                    settings=settings,
+                    budget=budget,
+                    generate_fn=generate_fn,
+                )
+                total_attempts += batch_attempts
+                if exc is not None:
+                    if exc.action == FailureAction.SPLIT and len(batch) > 1:
+                        mid = len(batch) // 2
+                        pending_wave[q_idx:q_idx] = [
+                            (f"{batch_id}.1", batch[:mid]),
+                            (f"{batch_id}.2", batch[mid:]),
+                        ]
+                        continue
+                    incomplete_reasons.append(f"Пакет генерации вопросов {batch_id} не завершён: {exc}.")
+                    if exc.reason in _STOP_ALL_REASONS:
+                        stop_all = True
+                        break
+                    continue
+                if stage_result is None:
+                    continue
+                if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
+                    known_in += stage_result.input_tokens
+                    known_out += stage_result.output_tokens
+                    has_known_usage = True
+                _consume_questions(batch_id, batch, stage_result.output)
+            break
+
+        next_wave: list[tuple[str, list[Finding]]] = []
+        with ThreadPoolExecutor(max_workers=min(workers, len(pending_wave))) as pool:
+            futures = [
+                (
+                    bid,
+                    b,
+                    pool.submit(
+                        _execute_question_batch,
+                        batch_id=bid,
+                        batch=b,
+                        document=document,
+                        settings=settings,
+                        budget=budget,
+                        generate_fn=generate_fn,
+                    ),
+                )
+                for bid, b in pending_wave
+            ]
+            wave_results = [(bid, b, *fut.result()) for bid, b, fut in futures]
+
+        for batch_id, batch, stage_result, exc, batch_attempts in wave_results:
+            total_attempts += batch_attempts
+            if exc is not None:
+                if exc.action == FailureAction.SPLIT and len(batch) > 1:
+                    mid = len(batch) // 2
+                    next_wave.extend(
+                        [(f"{batch_id}.1", batch[:mid]), (f"{batch_id}.2", batch[mid:])]
+                    )
+                    continue
+                incomplete_reasons.append(f"Пакет генерации вопросов {batch_id} не завершён: {exc}.")
+                if exc.reason in _STOP_ALL_REASONS:
+                    stop_all = True
+                continue
+            if stage_result is None:
+                continue
+            if stage_result.input_tokens is not None and stage_result.output_tokens is not None:
+                known_in += stage_result.input_tokens
+                known_out += stage_result.output_tokens
+                has_known_usage = True
+            _consume_questions(batch_id, batch, stage_result.output)
+        pending_wave = next_wave
 
     valid_candidates.sort(key=lambda item: item[0])
     questions = [

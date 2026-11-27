@@ -26,6 +26,7 @@ from src.contracts import (
     readiness_policy,
 )
 from src.pipeline.questions import generate_questions, record_answer
+from src.provider import FailureAction, FailureReason, ProviderError
 from src.provider.dto import (
     QuestionCandidate,
     QuestionGenerationOutput,
@@ -367,3 +368,89 @@ def test_blocking_uncertainty_on_major_finding_prevents_go_or_conditional_go():
         uncertainties=result.blocking_uncertainties,
     )
     assert readiness_policy(coverage, [f_major], result.blocking_uncertainties) == Readiness.UNDETERMINED
+
+
+def test_questions_split_on_truncation_repair_malformed_and_skip_when_no_eligible():
+    doc = _make_doc()
+    empty_res = generate_questions(
+        [],
+        doc,
+        ProviderSettings(api_key="test"),
+        generate_fn=lambda *a, **k: pytest.fail("should not call provider when no eligible findings"),
+    )
+    assert empty_res.questions == []
+    assert empty_res.attempts == 0
+
+    f1 = Finding(
+        finding_id="F001",
+        kind=FindingType.CONTRADICTION,
+        severity=Severity.CRITICAL,
+        claim="Противоречие возврата комиссии.",
+        recommendation="Согласовать возврат.",
+        requirement_ids=["R001", "R002"],
+        criteria=[QualityCriterion.SET_CONSISTENT],
+        evidence=[_ref(doc, "B001"), _ref(doc, "B002")],
+        semantic_status=SemanticStatus.SUPPORTED,
+        verification_reason="Подтверждено.",
+    )
+    f2 = Finding(
+        finding_id="F002",
+        kind=FindingType.AMBIGUITY,
+        severity=Severity.MAJOR,
+        claim="Не задан числовой лимит VIP.",
+        recommendation="Указать сумму лимита.",
+        requirement_ids=["R004"],
+        criteria=[QualityCriterion.UNAMBIGUOUS],
+        evidence=[_ref(doc, "B004")],
+        semantic_status=SemanticStatus.SUPPORTED,
+        verification_reason="Подтверждено.",
+    )
+
+    calls = 0
+
+    def fake_generate(stage, payload: QuestionGenerationPayload, output_type, *, settings=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise ProviderError(
+                "Truncated structured response (MAX_TOKENS)",
+                reason=FailureReason.TRUNCATED,
+                action=FailureAction.SPLIT,
+                attempts=1,
+            )
+        if calls == 2 and payload.repair_hint is None:
+            raise ProviderError(
+                "Malformed structured response",
+                reason=FailureReason.MALFORMED_RESPONSE,
+                action=FailureAction.REPAIR,
+                attempts=1,
+            )
+        fid = payload.findings[0].finding_id
+        bid = payload.findings[0].evidence[0].block_id
+        return StageResult[QuestionGenerationOutput](
+            stage=PipelineStage.CLARIFY,
+            output=QuestionGenerationOutput(
+                questions=[
+                    QuestionCandidate(
+                        finding_ids=[fid],
+                        requirement_ids=payload.findings[0].requirement_ids,
+                        evidence_block_ids=[bid],
+                        uncertainty=f"Не принято решение по {fid}.",
+                        stakeholder=StakeholderRole.PRODUCT,
+                        priority=QuestionPriority.HIGH,
+                        business_impact="Риск задержки релиза.",
+                        question=f"Какое целевое правило необходимо закрепить для устранения {fid}?",
+                        options=[
+                            QuestionOptionDraft(label="Вариант А", consequence="Обновить раздел 1 и тесты."),
+                            QuestionOptionDraft(label="Вариант Б", consequence="Обновить раздел 2 и уведомления."),
+                        ],
+                    )
+                ]
+            ),
+            attempts=1,
+        )
+
+    res = generate_questions([f1, f2], doc, ProviderSettings(api_key="test"), generate_fn=fake_generate)
+    assert calls == 4  # 1 split + 1 malformed + 1 repair + 1 ok
+    assert [q.question_id for q in res.questions] == ["Q001", "Q002"]
+    assert res.incomplete_reasons == []

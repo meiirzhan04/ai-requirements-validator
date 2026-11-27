@@ -22,7 +22,8 @@ QUESTIONS_SYSTEM_PROMPT = (
     "   - `business_impact`: concrete delivery, compliance, QA, or financial impact if left unresolved.\n"
     "   - `question`: specific, decision-oriented question (NEVER generic prompts like 'Уточните требование?').\n"
     "   - `options`: AT LEAST TWO distinct, actionable resolution options, each with a concise `label` and "
-    "     concrete `consequence` describing what must change in the specification.\n"
+    "     concrete `consequence` giving actionable remediation guidance (exact specification rule, section, API contract, "
+    "     or acceptance criterion to update and its delivery/QA trade-off).\n"
     "   - `blocks_readiness`: true if this unresolved uncertainty prevents safe GO/CONDITIONAL_GO readiness.\n"
     "4. Do NOT fabricate quotes, external policies, or unrelated requirement IDs."
 )

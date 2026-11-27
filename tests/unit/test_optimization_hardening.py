@@ -338,3 +338,17 @@ def test_recheck_diff_summarizes_before_and_after_transitions(report):
     assert by_label["Готовность"]["До исправления"] == "Не готово"
     assert by_label["Критические дефекты"]["До исправления"] == "1"
     assert by_label["Подтверждённые нарушения"]["После повторной проверки"] == "1"
+
+
+def test_dto_json_schemas_enforce_strict_criterion_scope_boundaries():
+    import json
+    from src.provider.dto import HolisticAuditOutput, IndividualAuditOutput
+
+    indiv_schema = json.dumps(IndividualAuditOutput.model_json_schema())
+    hol_schema = json.dumps(HolisticAuditOutput.model_json_schema())
+    assert "29148.5.2.5.unambiguous" in indiv_schema
+    assert "830.4.3.consistent" not in indiv_schema
+    assert "29148.5.2.6.consistent" not in indiv_schema
+    assert "830.4.3.consistent" in hol_schema
+    assert "29148.5.2.6.consistent" in hol_schema
+    assert "29148.5.2.5.necessary" not in hol_schema

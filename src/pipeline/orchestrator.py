@@ -334,7 +334,7 @@ def execute_pipeline(
     agent_revision: str | None = None,
     max_input_tokens: int = 24_000,
     max_output_tokens: int = 12_000,
-    max_requirements_per_batch: int = 10,
+    max_requirements_per_batch: int = 12,
     max_requirements_per_group: int = 80,
     verification_batch_size: int = 16,
     question_batch_size: int = 16,
@@ -350,7 +350,9 @@ def execute_pipeline(
     started_at = datetime.now(timezone.utc)
     started_mono = time.monotonic()
     revision = agent_revision or _detect_agent_revision()
-    active_budget = budget or QuotaBudget()
+    active_budget = budget or QuotaBudget(
+        base_delay_seconds=2.0 if generate_fn is generate else 1.0,
+    )
     effective_concurrency = (
         max(1, max_concurrency)
         if max_concurrency is not None

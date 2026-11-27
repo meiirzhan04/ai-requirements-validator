@@ -2,6 +2,7 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 import inspect
+import re
 
 from pydantic import Field
 
@@ -43,6 +44,12 @@ _STOP_ALL_REASONS = frozenset(
         FailureReason.BUDGET_EXHAUSTED,
     }
 )
+_EXCEPTION_OR_GLOSSARY_RE = re.compile(
+    r"\b(?:исключени\w*|за\s+исключением|кроме|глоссарий|термин\w*|определени\w*|общие\s+правила|"
+    r"часов\w*\s+пояс|UTC|GMT|примечани\w*|glossary|exception\w*|definitions?|unless)\b",
+    re.IGNORECASE,
+)
+_VERIFY_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9/_-]{5,}")
 
 
 class VerificationResult(Contract):
@@ -183,6 +190,33 @@ def _execute_verification_batch(
             include_full_doc_context and blk.block_id in effective_inspected
         ) or blk.location.section in cited_sections or len(document.version.blocks) <= 20:
             context_block_ids.add(blk.block_id)
+
+    # On large documents, also retrieve compact glossary/exception/shared-term passages
+    # from inspected scope so semantic verification does not miss explicit exceptions elsewhere.
+    if not include_full_doc_context and len(document.version.blocks) > 20:
+        batch_terms = {
+            tok.lower()
+            for f in batch
+            for tok in _VERIFY_TOKEN_RE.findall(
+                f"{f.claim} {' '.join(ref.quote for ref in f.evidence)} {f.gap.expected_information if f.gap else ''}"
+            )
+        }
+        scored_extras: list[tuple[int, int, str]] = []
+        for idx, blk in enumerate(document.version.blocks):
+            if blk.block_id in context_block_ids or blk.block_id not in effective_inspected:
+                continue
+            has_exception_cue = bool(
+                _EXCEPTION_OR_GLOSSARY_RE.search(blk.location.section)
+                or _EXCEPTION_OR_GLOSSARY_RE.search(blk.text)
+            )
+            blk_terms = {tok.lower() for tok in _VERIFY_TOKEN_RE.findall(blk.text)}
+            overlap = len(batch_terms & blk_terms)
+            if has_exception_cue or overlap >= 2:
+                score = (3 if has_exception_cue else 0) + min(overlap, 5)
+                scored_extras.append((-score, idx, blk.block_id))
+        scored_extras.sort()
+        for _, _, bid in scored_extras[:12]:
+            context_block_ids.add(bid)
 
     passages = [
         HolisticPassageInput(

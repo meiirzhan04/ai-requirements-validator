@@ -55,7 +55,7 @@ except ImportError:  # pragma: no cover - fallback only when #4 is not yet merge
 
 logger = logging.getLogger(__name__)
 
-PIPELINE_PROMPT_VERSION = "pipeline-v2"
+PIPELINE_PROMPT_VERSION = "pipeline-v3"
 STAGE_PROMPT_VERSIONS = (
     EXTRACTION_PROMPT_VERSION,
     INDIVIDUAL_PROMPT_VERSION,

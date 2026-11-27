@@ -51,6 +51,10 @@ _GENERIC_QUESTION_PATTERNS = (
     re.compile(r"^please\s+clarify(?:\s+the\s+requirement)?\s*\??$", re.IGNORECASE),
     re.compile(r"^clarify\s+requirement\s*\??$", re.IGNORECASE),
 )
+_PLACEHOLDER_OPTION_PATTERNS = (
+    re.compile(r"^(?:tbd|todo|n/?a|unknown|позже|неизвестно|уточнить(?:\s+позже)?|на\s+усмотрение)\.?$", re.IGNORECASE),
+)
+_WORD_TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9]{3,}")
 _STOP_ALL_REASONS = frozenset(
     {
         FailureReason.AUTH_ERROR,
@@ -103,6 +107,19 @@ def _is_material_finding(finding: Finding, *, include_minor: bool = False) -> bo
     return include_minor
 
 
+def _is_placeholder_option(label: str) -> bool:
+    cleaned = _normalize(label)
+    return any(pattern.match(cleaned) for pattern in _PLACEHOLDER_OPTION_PATTERNS)
+
+
+def _token_overlap_ratio(left: str, right: str) -> float:
+    a = set(_WORD_TOKEN_RE.findall(left.lower()))
+    b = set(_WORD_TOKEN_RE.findall(right.lower()))
+    if not a or not b:
+        return 0.0
+    return len(a & b) / len(a | b)
+
+
 def _validate_and_build_options(candidate: QuestionCandidate) -> list[QuestionOption] | None:
     options: list[QuestionOption] = []
     seen_labels: set[str] = set()
@@ -111,7 +128,7 @@ def _validate_and_build_options(candidate: QuestionCandidate) -> list[QuestionOp
     for idx, opt in enumerate(candidate.options):
         label = opt.label.strip()
         consequence = opt.consequence.strip()
-        if not label or not consequence:
+        if not label or not consequence or _is_placeholder_option(label):
             return None
         norm_label = _normalize(label)
         if norm_label in seen_labels:
@@ -363,6 +380,70 @@ def generate_questions(
 
             sig = (tuple(sorted(fids)), _normalize(question_text))
             if sig in seen_question_signatures:
+                continue
+            # Consolidate near-duplicate questions targeting the same finding set (same stakeholder or high wording overlap).
+            fids_tuple = tuple(sorted(fids))
+            duplicate_idx: int | None = None
+            for existing_idx, (_, existing_fields) in enumerate(valid_candidates):
+                existing_fids = tuple(sorted(existing_fields["finding_ids"]))
+                if existing_fids != fids_tuple:
+                    continue
+                same_owner = existing_fields["stakeholder"] == cand.stakeholder
+                high_overlap = _token_overlap_ratio(
+                    f"{existing_fields['question']} {existing_fields['uncertainty']}",
+                    f"{question_text} {uncertainty_text}",
+                ) >= 0.5
+                if same_owner or high_overlap:
+                    duplicate_idx = existing_idx
+                    break
+            if duplicate_idx is not None:
+                prev_sort_key, prev_fields = valid_candidates[duplicate_idx]
+                merged_evidence = list(prev_fields["evidence"])
+                prev_anchors = {r.anchor for r in merged_evidence}
+                for r in evidence:
+                    if r.anchor not in prev_anchors:
+                        prev_anchors.add(r.anchor)
+                        merged_evidence.append(r)
+                merged_reqs = list(dict.fromkeys([*prev_fields["requirement_ids"], *req_ids]))
+                better_priority = (
+                    priority
+                    if _PRIORITY_ORDER[priority] < _PRIORITY_ORDER[prev_fields["priority"]]
+                    else prev_fields["priority"]
+                )
+                prefer_new = (
+                    _PRIORITY_ORDER[priority] < _PRIORITY_ORDER[prev_fields["priority"]]
+                    or (
+                        priority == prev_fields["priority"]
+                        and len(options) > len(prev_fields["options"])
+                    )
+                )
+                base_fields = (
+                    {
+                        "finding_ids": fids,
+                        "requirement_ids": merged_reqs,
+                        "evidence": merged_evidence,
+                        "uncertainty": uncertainty_text,
+                        "stakeholder": cand.stakeholder,
+                        "priority": better_priority,
+                        "business_impact": business_impact,
+                        "question": question_text,
+                        "options": options,
+                        "allow_custom": True,
+                    }
+                    if prefer_new
+                    else {
+                        **prev_fields,
+                        "requirement_ids": merged_reqs,
+                        "evidence": merged_evidence,
+                        "priority": better_priority,
+                    }
+                )
+                first_block_idx = min(block_order.get(ref.block_id, 10**9) for ref in merged_evidence)
+                valid_candidates[duplicate_idx] = (
+                    (_PRIORITY_ORDER[better_priority], first_block_idx, fids[0]),
+                    base_fields,
+                )
+                seen_question_signatures.add(sig)
                 continue
             seen_question_signatures.add(sig)
 

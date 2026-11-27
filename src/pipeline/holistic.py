@@ -55,6 +55,59 @@ GroundFn = Callable[[EvidenceCandidate, ParsedDocument], GroundingResult]
 _WHOLE_SET_ORDERED = tuple(sorted(WHOLE_SET, key=lambda c: c.value))
 _TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9/_-]{4,}")
 _API_RE = re.compile(r"(?:/[A-Za-z0-9_{}.-]+)+|\b(?:GET|POST|PUT|PATCH|DELETE|HTTP\s*\d{3})\b", re.IGNORECASE)
+_DOMAIN_ANCHOR_RE = re.compile(
+    r"\b(?:UTC(?:[+-]\d{1,2}(?::\d{2})?)?|GMT(?:[+-]\d{1,2})?|"
+    r"KZT|USD|EUR|RUB|GBP|CNY|SLA|TTL|OTP|API|REST|JSON|ISO|"
+    r"NEW|DRAFT|PENDING|ACTIVE|PAID|FAILED|CLOSED|CANCELLED|CANCELED|BLOCKED|EXPIRED|ERROR|SUCCESS|OK)\b",
+)
+_HTTP_STATUS_CONTEXT_RE = re.compile(
+    r"(?:HTTP|статус|код|status|code)[^\n\r\d]{0,12}\b([1-5]\d{2})\b",
+    re.IGNORECASE,
+)
+_SEMANTIC_FOCUS_PATTERNS: tuple[tuple[str, re.Pattern[str]], ...] = (
+    (
+        "timing_calendar",
+        re.compile(
+            r"\b(?:UTC|GMT|часов\w*\s+пояс\w*|таймзон\w*|дата\s+(?:операц|событ|обработ|провод|расч)|"
+            r"время\s+(?:событ|операц|обработ)|календарн\w*|рабоч\w*\s+дн\w*|расч[её]тн\w*\s+(?:период|месяц)|"
+            r"конец\s+месяц|полноч|23:59|00:00|включая|исключительно|не\s+позднее|в\s+течение)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "state_transitions",
+        re.compile(
+            r"(?:->|→|\b(?:статус\w*|состояни\w*|переход\w*|терминальн\w*|финальн\w*|отмен\w*|блокир\w*|"
+            r"NEW|DRAFT|PENDING|ACTIVE|PAID|FAILED|CLOSED|CANCELLED|CANCELED|BLOCKED|EXPIRED)\b)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "repeated_events",
+        re.compile(
+            r"\b(?:не\s+более\s+(?:одного|1)\s+раз|единожды|повторн\w*|сброс\w*|пересч[её]т\w*|"
+            r"независимо\s+от|каждый\s+раз|идемпотент\w*|дубликат\w*|изменени\w*\s+(?:порог|лимит|параметр)|"
+            r"rate\s*limit|idempoten\w*|re-?trigger\w*)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "api_consistency",
+        re.compile(
+            r"(?:/[A-Za-z0-9_{}.-]+){2,}|\b(?:GET|POST|PUT|PATCH|DELETE|HTTP\s*[1-5]\d{2}|"
+            r"эндпоинт\w*|endpoint\w*|webhook\w*|payload|JSON|OpenAPI|Swagger|ERROR)\b",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        "units_exceptions",
+        re.compile(
+            r"\b(?:KZT|USD|EUR|RUB|тенге|доллар\w*|евро|руб\w*|процент\w*|мс|сек\w*|мин\w*|"
+            r"за\s+исключением|кроме|исключая|только\s+для|только\s+если|без\s+исключений)\b|%",
+            re.IGNORECASE,
+        ),
+    ),
+)
 _WHITESPACE_RE = re.compile(r"\s+")
 _STOP_WORDS = frozenset(
     {
@@ -145,6 +198,10 @@ def _extract_index_terms(text: str) -> set[str]:
     terms: set[str] = set()
     for match in _API_RE.findall(text):
         terms.add(_normalize_key(match))
+    for anchor in _DOMAIN_ANCHOR_RE.findall(text):
+        terms.add(f"anchor:{anchor.lower()}")
+    for status_code in _HTTP_STATUS_CONTEXT_RE.findall(text):
+        terms.add(f"http:{status_code}")
     for tok in _TOKEN_RE.findall(text.lower()):
         cleaned = tok.strip("_-/")
         if len(cleaned) < 4 or cleaned in _STOP_WORDS or cleaned.isdigit():
@@ -153,6 +210,41 @@ def _extract_index_terms(text: str) -> set[str]:
         stem = cleaned[:6] if len(cleaned) >= 7 else cleaned
         terms.add(stem)
     return terms
+
+
+def build_semantic_focus_signals(
+    document: ParsedDocument,
+    allowed_blocks: set[str],
+    *,
+    allowed_categories: set[str] | None = None,
+) -> list[str]:
+    """Produce compact generalized cross-section semantic focus hints without hardcoding any sample."""
+    hits_by_category: dict[str, list[str]] = defaultdict(list)
+    sections_by_category: dict[str, set[str]] = defaultdict(set)
+    for block in document.version.blocks:
+        if block.block_id not in allowed_blocks:
+            continue
+        for category, pattern in _SEMANTIC_FOCUS_PATTERNS:
+            if allowed_categories is not None and category not in allowed_categories:
+                continue
+            if pattern.search(block.text):
+                hits_by_category[category].append(block.block_id)
+                sections_by_category[category].add(block.location.section)
+
+    signals: list[str] = []
+    for category, _ in _SEMANTIC_FOCUS_PATTERNS:
+        block_ids = hits_by_category.get(category)
+        if not block_ids:
+            continue
+        # Emit focus hint when >= 2 blocks (or API contract markers) warrant cross-checking.
+        if len(block_ids) >= 2 or (category == "api_consistency" and len(block_ids) >= 1):
+            preview = ", ".join(block_ids[:10])
+            if len(block_ids) > 10:
+                preview += f" (+{len(block_ids) - 10})"
+            signals.append(
+                f"semantic_focus:{category} ({len(sections_by_category[category])} sections) @ [{preview}]"
+            )
+    return signals
 
 
 def _has_independent_anchors(refs: list[EvidenceRef]) -> bool:
@@ -326,6 +418,27 @@ def build_cross_section_groups(
     return groups
 
 
+def _contradiction_anchors_overlap(left: list[EvidenceRef], right: list[EvidenceRef]) -> bool:
+    """Return True when two contradictions cite the same blocks with overlapping spans on every block."""
+    left_by_block: dict[str, list[EvidenceRef]] = defaultdict(list)
+    right_by_block: dict[str, list[EvidenceRef]] = defaultdict(list)
+    for ref in left:
+        left_by_block[ref.block_id].append(ref)
+    for ref in right:
+        right_by_block[ref.block_id].append(ref)
+    if not left_by_block or set(left_by_block) != set(right_by_block):
+        return False
+    for bid, l_refs in left_by_block.items():
+        r_refs = right_by_block[bid]
+        for lr in l_refs:
+            if not any(lr.start < rr.end and rr.start < lr.end for rr in r_refs):
+                return False
+        for rr in r_refs:
+            if not any(rr.start < lr.end and lr.start < rr.end for lr in l_refs):
+                return False
+    return True
+
+
 def deduplicate_findings(
     findings: list[Finding],
     *,
@@ -345,18 +458,28 @@ def deduplicate_findings(
     }
 
     groups: dict[tuple[str, tuple[tuple[str, str, int, int], ...], str], list[Finding]] = {}
+    contradiction_buckets: list[list[Finding]] = []
     for finding in findings:
+        if finding.kind == FindingType.CONTRADICTION:
+            matched_bucket = None
+            for bucket in contradiction_buckets:
+                if any(_contradiction_anchors_overlap(finding.evidence, existing.evidence) for existing in bucket):
+                    matched_bucket = bucket
+                    break
+            if matched_bucket is not None:
+                matched_bucket.append(finding)
+            else:
+                contradiction_buckets.append([finding])
+            continue
         anchors = tuple(sorted(ref.anchor for ref in finding.evidence))
         if not anchors and finding.gap is not None:
             anchors = (finding.gap.context.anchor,)
-        # Contradictions with identical pair of anchors represent the same underlying conflict;
-        # other finding types key on (kind, anchors, normalized claim).
-        claim_part = "" if finding.kind == FindingType.CONTRADICTION else _normalize_key(finding.claim)
-        sig = (finding.kind.value, anchors, claim_part)
+        sig = (finding.kind.value, anchors, _normalize_key(finding.claim))
         groups.setdefault(sig, []).append(finding)
 
+    all_buckets: list[list[Finding]] = [*contradiction_buckets, *groups.values()]
     merged_items: list[tuple[tuple[int, int, str], Finding, list[str]]] = []
-    for sig, bucket in groups.items():
+    for bucket in all_buckets:
         primary = max(bucket, key=lambda f: (severity_rank[f.severity], semantic_rank[f.semantic_status], len(f.claim)))
         all_req_ids = list(dict.fromkeys(rid for f in bucket for rid in f.requirement_ids))
         all_criteria = sorted({c for f in bucket for c in f.criteria}, key=lambda c: c.value)
@@ -680,11 +803,17 @@ def _execute_holistic_group(
         for rid in group.requirement_ids
         if rid in req_map
     ]
-    group_signals = (
-        []
-        if group.group_id == "rules-acceptance"
-        else _format_structural_signals(structural_signals, group_inspected_set)
-    )
+    if group.group_id == "rules-acceptance":
+        group_signals = build_semantic_focus_signals(
+            document,
+            group_inspected_set,
+            allowed_categories={"timing_calendar", "state_transitions", "repeated_events", "units_exceptions"},
+        )
+    else:
+        group_signals = [
+            *_format_structural_signals(structural_signals, group_inspected_set),
+            *build_semantic_focus_signals(document, group_inspected_set),
+        ]
     system_prompt = (
         HOLISTIC_LOGIC_SYSTEM_PROMPT
         if group.group_id == "rules-acceptance"

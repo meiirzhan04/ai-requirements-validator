@@ -1,6 +1,6 @@
 """Single Gemini transport entry point for pipeline and clarification stages."""
 from collections.abc import Iterator
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -174,32 +174,35 @@ def generate(
             estimated_tokens=estimated_tokens,
         )
         call_attempts += 1
-        config_kwargs: dict[str, Any] = {
-            "response_mime_type": "application/json",
-            "response_json_schema": schema,
-            "temperature": 0.0,
-            "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
-        }
-        thinking_budget = _THINKING_BUDGET_BY_STAGE.get(stage)
-        if thinking_budget is not None and _supports_thinking_budget(settings.model):
-            config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
-        if system_instruction is not None:
-            config_kwargs["system_instruction"] = system_instruction
-
         privacy_token = _PRIVATE_REQUEST.set(True)
         try:
+            config_kwargs: dict[str, Any] = {
+                "response_mime_type": "application/json",
+                "response_json_schema": schema,
+                "temperature": 0.0,
+                "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
+            }
+            thinking_budget = _THINKING_BUDGET_BY_STAGE.get(stage)
+            if thinking_budget is not None and _supports_thinking_budget(settings.model):
+                config_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=thinking_budget)
+            if system_instruction is not None:
+                config_kwargs["system_instruction"] = system_instruction
+
             http = types.HttpOptions(
                 timeout=active_budget.effective_timeout_ms(settings.timeout_ms, call_attempts=call_attempts),
                 retry_options=types.HttpRetryOptions(attempts=1),
             )
-            with _borrow_client(secret, http) as client:
-                http.timeout = active_budget.effective_timeout_ms(settings.timeout_ms, call_attempts=call_attempts)
-                config_kwargs["http_options"] = http
-                config = types.GenerateContentConfig(**config_kwargs)
-                with active_budget.measure_api_call():
-                    response = client.models.generate_content(
-                        model=settings.model, contents=serialized_payload, config=config,
-                    )
+            acquire_fn = getattr(active_budget, "acquire_in_flight", None)
+            slot_ctx = acquire_fn(call_attempts=call_attempts) if callable(acquire_fn) else nullcontext()
+            with slot_ctx:
+                with _borrow_client(secret, http) as client:
+                    http.timeout = active_budget.effective_timeout_ms(settings.timeout_ms, call_attempts=call_attempts)
+                    config_kwargs["http_options"] = http
+                    config = types.GenerateContentConfig(**config_kwargs)
+                    with active_budget.measure_api_call():
+                        response = client.models.generate_content(
+                            model=settings.model, contents=serialized_payload, config=config,
+                        )
         except errors.APIError as exc:
             err = classify_api_error(exc, attempts=call_attempts)
             server_delay = extract_retry_delay(exc) if err.retryable else None
@@ -240,8 +243,11 @@ def generate(
             attempts=call_attempts,
         )
     try:
-        output = output_type.model_validate_json(response.text or "", strict=True)
-    except ValidationError:
+        raw_text = response.text or ""
+        if not isinstance(raw_text, str):
+            raise ValueError("Structured response text must be a string")
+        output = output_type.model_validate_json(raw_text, strict=True)
+    except (ValidationError, ValueError, TypeError):
         active_budget.record_failure(FailureReason.MALFORMED_RESPONSE)
         raise ProviderError(
             "Malformed structured response",

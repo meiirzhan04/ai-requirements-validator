@@ -10,7 +10,6 @@ import subprocess
 import threading
 import time
 from typing import Any
-from uuid import uuid4
 
 from src.contracts import (
     Coverage,
@@ -34,8 +33,14 @@ from src.contracts import (
     WorkSet,
 )
 from src.evidence import ground
+from src.pipeline.diagnostics import log_safe_exception, new_run_id
 from src.pipeline.extraction import ExtractionResult, extract_requirements
-from src.pipeline.holistic import HolisticAuditResult, audit_holistic_set, deduplicate_findings
+from src.pipeline.holistic import (
+    HolisticAuditResult,
+    audit_holistic_set,
+    build_cross_section_groups,
+    deduplicate_findings,
+)
 from src.pipeline.individual import IndividualAuditResult, audit_individual_requirements
 from src.pipeline.questions import QuestionGenerationResult, generate_questions
 from src.pipeline.verification import VerificationResult, reconcile_evaluations_with_findings, verify_findings
@@ -322,6 +327,74 @@ def _build_report(
     )
 
 
+def _fallback_extraction(
+    document: ParsedDocument,
+    run_id: str,
+    exc: BaseException,
+) -> ExtractionResult:
+    return ExtractionResult(
+        requirements=[],
+        extraction_blocks=WorkSet(
+            planned=[b.block_id for b in document.version.blocks],
+            completed=[],
+        ),
+        context_blocks={},
+        batches=WorkSet(planned=["extract-failed"], completed=[]),
+        incomplete_reasons=[
+            f"Внутренний сбой этапа извлечения требований ({type(exc).__name__}, код диагностики: {run_id})."
+        ],
+    )
+
+
+def _fallback_individual(
+    requirements: list[Requirement],
+    run_id: str,
+    exc: BaseException,
+) -> IndividualAuditResult:
+    return IndividualAuditResult(
+        evaluations=[],
+        findings=[],
+        individual_requirements=WorkSet(
+            planned=[r.req_id for r in requirements],
+            completed=[],
+        ),
+        audit_batches=WorkSet(planned=["indiv-failed"], completed=[]),
+        incomplete_reasons=[
+            f"Внутренний сбой этапа индивидуального аудита ({type(exc).__name__}, код диагностики: {run_id})."
+        ],
+    )
+
+
+def _fallback_holistic(
+    requirements: list[Requirement],
+    document: ParsedDocument,
+    max_requirements_per_group: int,
+    run_id: str,
+    exc: BaseException,
+) -> HolisticAuditResult:
+    try:
+        planned = [
+            g.group_id
+            for g in build_cross_section_groups(
+                requirements,
+                document,
+                max_requirements_per_group=max_requirements_per_group,
+            )
+        ]
+    except Exception:
+        planned = []
+    if not planned:
+        planned = ["whole-spec"]
+    return HolisticAuditResult(
+        evaluations=[],
+        findings=[],
+        cross_section_groups=WorkSet(planned=planned, completed=[]),
+        incomplete_reasons=[
+            f"Внутренний сбой этапа целостного аудита ({type(exc).__name__}, код диагностики: {run_id})."
+        ],
+    )
+
+
 def execute_pipeline(
     document: ParsedDocument,
     settings: ProviderSettings,
@@ -347,21 +420,23 @@ def execute_pipeline(
     if not isinstance(settings, ProviderSettings):
         raise ValueError("settings must be a valid ProviderSettings")
 
-    active_run_id = run_id or f"run-{uuid4().hex[:12]}"
+    active_run_id = run_id or new_run_id()
     started_at = datetime.now(timezone.utc)
     started_mono = time.monotonic()
     revision = agent_revision or _detect_agent_revision()
-    active_budget = budget or QuotaBudget(
-        base_delay_seconds=3.0 if generate_fn is generate else 1.0,
-    )
     effective_concurrency = (
         max(1, max_concurrency)
         if max_concurrency is not None
         else (2 if generate_fn is generate else 1)
     )
+    active_budget = budget or QuotaBudget(
+        base_delay_seconds=3.0 if generate_fn is generate else 1.0,
+        max_in_flight=effective_concurrency if generate_fn is generate else None,
+    )
     emit_lock = threading.Lock()
 
     def _safe_emit_event(event: ProgressEvent) -> None:
+        logger.info("run=%s stage=%s state=%s", active_run_id, event.stage.value, event.state)
         if on_progress is None:
             return
         try:
@@ -369,11 +444,13 @@ def execute_pipeline(
                 on_progress(event)
         except Exception as exc:
             # Progress rendering failures must never abort a healthy validation run or leak private content.
-            logger.warning(
-                "run=%s stage=%s progress_callback_failed error_type=%s",
-                active_run_id,
-                event.stage.value,
-                type(exc).__name__,
+            log_safe_exception(
+                logger,
+                "progress_callback_failed",
+                exc,
+                run_id=active_run_id,
+                stage=event.stage.value,
+                level=logging.WARNING,
             )
 
     def _safe_emit(stage: PipelineStage, state: str, message: str) -> None:
@@ -483,18 +560,30 @@ def execute_pipeline(
             "started",
             f"Извлечение атомарных требований из {len(blocks)} блоков.",
         )
-        extraction = extract_requirements(
-            document,
-            settings,
-            budget=active_budget,
-            generate_fn=generate_fn,
-            ground_fn=ground_fn,
-            max_input_tokens=max_input_tokens,
-            max_output_tokens=max_output_tokens,
-            max_concurrency=effective_concurrency,
-            retry_ungrounded_blocks=(generate_fn is generate),
-        )
-        extraction_blocks, context_blocks, scope_reasons = _reconcile_extraction_scope(document, extraction)
+        try:
+            extraction = extract_requirements(
+                document,
+                settings,
+                budget=active_budget,
+                generate_fn=generate_fn,
+                ground_fn=ground_fn,
+                max_input_tokens=max_input_tokens,
+                max_output_tokens=max_output_tokens,
+                max_concurrency=effective_concurrency,
+                retry_ungrounded_blocks=(generate_fn is generate),
+                run_id=active_run_id,
+            )
+            extraction_blocks, context_blocks, scope_reasons = _reconcile_extraction_scope(document, extraction)
+        except Exception as exc:
+            log_safe_exception(
+                logger,
+                "pipeline_stage_failed",
+                exc,
+                run_id=active_run_id,
+                stage=PipelineStage.EXTRACT.value,
+            )
+            extraction = _fallback_extraction(document, active_run_id, exc)
+            extraction_blocks, context_blocks, scope_reasons = _reconcile_extraction_scope(document, extraction)
 
         incomplete_reasons: list[str] = [*scope_reasons, *extraction.incomplete_reasons]
         if not extraction.batches.complete:
@@ -543,6 +632,13 @@ def execute_pipeline(
             audit_batches = extraction.batches
             cross_section_groups = WorkSet(planned=[], completed=[])
         else:
+            in_flight_capped = getattr(active_budget, "max_in_flight", None) is not None
+            stage_concurrency = (
+                effective_concurrency
+                if (in_flight_capped or generate_fn is not generate)
+                else (max(1, effective_concurrency - 1) if effective_concurrency > 1 else 1)
+            )
+
             def _run_individual(
                 emit_fn: Callable[[PipelineStage, str, str], None] = _safe_emit,
             ) -> IndividualAuditResult:
@@ -563,7 +659,8 @@ def execute_pipeline(
                     max_input_tokens=max_input_tokens,
                     max_output_tokens=max_output_tokens,
                     max_requirements_per_batch=max_requirements_per_batch,
-                    max_concurrency=max(1, effective_concurrency - 1) if effective_concurrency > 1 else 1,
+                    max_concurrency=stage_concurrency,
+                    run_id=active_run_id,
                 )
                 logger.info(
                     "run=%s stage=individual dt=%.2fs reqs=%d/%d findings=%d attempts=%d",
@@ -601,7 +698,8 @@ def execute_pipeline(
                     generate_fn=generate_fn,
                     ground_fn=ground_fn,
                     max_requirements_per_group=max_requirements_per_group,
-                    max_concurrency=1,
+                    max_concurrency=stage_concurrency if in_flight_capped else 1,
+                    run_id=active_run_id,
                 )
                 logger.info(
                     "run=%s stage=holistic dt=%.2fs groups=%d/%d findings=%d attempts=%d",
@@ -647,11 +745,75 @@ def execute_pipeline(
                             pass
                         _drain_stage_events()
                     _drain_stage_events()
-                    indiv = indiv_fut.result()
-                    holistic = holistic_fut.result()
+                    try:
+                        indiv = indiv_fut.result()
+                    except Exception as exc:
+                        log_safe_exception(
+                            logger,
+                            "pipeline_stage_failed",
+                            exc,
+                            run_id=active_run_id,
+                            stage=PipelineStage.INDIVIDUAL.value,
+                        )
+                        _safe_emit(
+                            PipelineStage.INDIVIDUAL,
+                            "failed",
+                            f"Индивидуальный аудит прерван внутренней ошибкой ({type(exc).__name__}, код: {active_run_id}).",
+                        )
+                        indiv = _fallback_individual(requirements, active_run_id, exc)
+                    try:
+                        holistic = holistic_fut.result()
+                    except Exception as exc:
+                        log_safe_exception(
+                            logger,
+                            "pipeline_stage_failed",
+                            exc,
+                            run_id=active_run_id,
+                            stage=PipelineStage.HOLISTIC.value,
+                        )
+                        _safe_emit(
+                            PipelineStage.HOLISTIC,
+                            "failed",
+                            f"Целостный аудит прерван внутренней ошибкой ({type(exc).__name__}, код: {active_run_id}).",
+                        )
+                        holistic = _fallback_holistic(
+                            requirements, document, max_requirements_per_group, active_run_id, exc
+                        )
             else:
-                indiv = _run_individual()
-                holistic = _run_holistic()
+                try:
+                    indiv = _run_individual()
+                except Exception as exc:
+                    log_safe_exception(
+                        logger,
+                        "pipeline_stage_failed",
+                        exc,
+                        run_id=active_run_id,
+                        stage=PipelineStage.INDIVIDUAL.value,
+                    )
+                    _safe_emit(
+                        PipelineStage.INDIVIDUAL,
+                        "failed",
+                        f"Индивидуальный аудит прерван внутренней ошибкой ({type(exc).__name__}, код: {active_run_id}).",
+                    )
+                    indiv = _fallback_individual(requirements, active_run_id, exc)
+                try:
+                    holistic = _run_holistic()
+                except Exception as exc:
+                    log_safe_exception(
+                        logger,
+                        "pipeline_stage_failed",
+                        exc,
+                        run_id=active_run_id,
+                        stage=PipelineStage.HOLISTIC.value,
+                    )
+                    _safe_emit(
+                        PipelineStage.HOLISTIC,
+                        "failed",
+                        f"Целостный аудит прерван внутренней ошибкой ({type(exc).__name__}, код: {active_run_id}).",
+                    )
+                    holistic = _fallback_holistic(
+                        requirements, document, max_requirements_per_group, active_run_id, exc
+                    )
 
             incomplete_reasons.extend(indiv.incomplete_reasons)
             if not indiv.individual_requirements.complete:
@@ -694,17 +856,34 @@ def execute_pipeline(
                 "started",
                 f"Семантическая проверка серьёзных кандидатов: {to_verify_count}.",
             )
-            verification = verify_findings(
-                dedup_findings,
-                document,
-                settings,
-                evaluations=combined_evals,
-                inspected_blocks=completed_block_set,
-                budget=active_budget,
-                generate_fn=generate_fn,
-                batch_size=verification_batch_size,
-                max_concurrency=effective_concurrency,
-            )
+            try:
+                verification = verify_findings(
+                    dedup_findings,
+                    document,
+                    settings,
+                    evaluations=combined_evals,
+                    inspected_blocks=completed_block_set,
+                    budget=active_budget,
+                    generate_fn=generate_fn,
+                    batch_size=verification_batch_size,
+                    max_concurrency=effective_concurrency,
+                    run_id=active_run_id,
+                )
+            except Exception as exc:
+                log_safe_exception(
+                    logger,
+                    "pipeline_stage_failed",
+                    exc,
+                    run_id=active_run_id,
+                    stage=PipelineStage.VERIFY.value,
+                )
+                verification = VerificationResult(
+                    findings=list(dedup_findings),
+                    evaluations=reconcile_evaluations_with_findings(combined_evals, dedup_findings),
+                    incomplete_reasons=[
+                        f"Внутренний сбой этапа семантической проверки ({type(exc).__name__}, код диагностики: {active_run_id})."
+                    ],
+                )
             incomplete_reasons.extend(verification.incomplete_reasons)
             final_findings = verification.findings
             final_evaluations = reconcile_evaluations_with_findings(
@@ -732,15 +911,31 @@ def execute_pipeline(
                 "started",
                 "Формирование адресных вопросов для уточнения требований.",
             )
-            clarification = generate_questions(
-                final_findings,
-                document,
-                settings,
-                budget=active_budget,
-                generate_fn=generate_fn,
-                batch_size=question_batch_size,
-                max_concurrency=effective_concurrency,
-            )
+            try:
+                clarification = generate_questions(
+                    final_findings,
+                    document,
+                    settings,
+                    budget=active_budget,
+                    generate_fn=generate_fn,
+                    batch_size=question_batch_size,
+                    max_concurrency=effective_concurrency,
+                    run_id=active_run_id,
+                )
+            except Exception as exc:
+                log_safe_exception(
+                    logger,
+                    "pipeline_stage_failed",
+                    exc,
+                    run_id=active_run_id,
+                    stage=PipelineStage.CLARIFY.value,
+                )
+                clarification = QuestionGenerationResult(
+                    questions=[],
+                    incomplete_reasons=[
+                        f"Внутренний сбой этапа генерации вопросов ({type(exc).__name__}, код диагностики: {active_run_id})."
+                    ],
+                )
             incomplete_reasons.extend(clarification.incomplete_reasons)
             final_questions = clarification.questions
             logger.info(

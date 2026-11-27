@@ -11,7 +11,16 @@ import threading
 import time
 from typing import Any
 
-import httpx2
+try:
+    import httpx2
+
+    _TRANSPORT_RETRYABLE_TYPES: tuple[type[BaseException], ...] = (
+        ConnectionError,
+        httpx2.NetworkError,
+        httpx2.RemoteProtocolError,
+    )
+except ImportError:  # pragma: no cover - fallback when httpx2 is unavailable
+    _TRANSPORT_RETRYABLE_TYPES = (ConnectionError,)
 from google.genai import errors
 
 from src.contracts import PipelineStage
@@ -87,6 +96,7 @@ class QuotaBudget:
         tpm_limit: int | None = None,
         max_total_tokens: int | None = None,
         max_elapsed_seconds: float | None = None,
+        max_in_flight: int | None = None,
         base_delay_seconds: float = 1.0,
         max_delay_seconds: float = 30.0,
         jitter_ratio: float = 0.25,
@@ -96,6 +106,8 @@ class QuotaBudget:
     ) -> None:
         if not 1 <= max_attempts_per_call <= 3:
             raise ValueError("max_attempts_per_call must be between 1 and 3")
+        if max_in_flight is not None and max_in_flight < 1:
+            raise ValueError("max_in_flight must be at least 1")
         if any(not math.isfinite(v) or v < 0 for v in (base_delay_seconds, max_delay_seconds, jitter_ratio)):
             raise ValueError("Delay and jitter settings must be non-negative")
         self.max_attempts_per_call = max_attempts_per_call
@@ -105,6 +117,10 @@ class QuotaBudget:
         self.tpm_limit = tpm_limit
         self.max_total_tokens = max_total_tokens
         self.max_elapsed_seconds = max_elapsed_seconds
+        self.max_in_flight = max_in_flight
+        self._in_flight_sem = (
+            threading.BoundedSemaphore(max_in_flight) if max_in_flight is not None else None
+        )
         self.base_delay_seconds = base_delay_seconds
         self.max_delay_seconds = max_delay_seconds
         self.jitter_ratio = jitter_ratio
@@ -133,6 +149,29 @@ class QuotaBudget:
         self.attempts_by_stage: Counter[PipelineStage] = Counter()
         self._request_window: deque[float] = deque()
         self._token_window: deque[tuple[float, int]] = deque()
+
+    @contextmanager
+    def acquire_in_flight(self, *, call_attempts: int = 0):
+        """Cap concurrent live API calls across nested worker pools without inflating api_latency."""
+        sem = self._in_flight_sem
+        if sem is None:
+            yield
+            return
+        remaining = self.remaining_seconds()
+        if remaining is not None:
+            if remaining < 0.001 or not sem.acquire(timeout=remaining):
+                raise ProviderError(
+                    "Elapsed time budget exhausted",
+                    reason=FailureReason.BUDGET_EXHAUSTED,
+                    action=FailureAction.STOP,
+                    attempts=call_attempts,
+                )
+        else:
+            sem.acquire()
+        try:
+            yield
+        finally:
+            sem.release()
 
     @contextmanager
     def measure_api_call(self):
@@ -556,5 +595,5 @@ def classify_transport_error(exc: Exception, *, attempts: int) -> ProviderError:
         reason=FailureReason.TRANSPORT_ERROR,
         action=FailureAction.STOP,
         attempts=attempts,
-        retryable=isinstance(exc, (ConnectionError, httpx2.NetworkError, httpx2.RemoteProtocolError)),
+        retryable=isinstance(exc, _TRANSPORT_RETRYABLE_TYPES),
     )

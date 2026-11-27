@@ -3,6 +3,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import inspect
+import logging
 import re
 
 from pydantic import Field
@@ -21,6 +22,7 @@ from src.contracts import (
 )
 from src.contracts.source import Contract, Count, Id, Text
 from src.evidence import ground
+from src.pipeline.diagnostics import log_safe_exception
 from src.prompts.extraction import (
     EXTRACTION_PROMPT_VERSION,
     EXTRACTION_QUOTE_REPAIR_HINT,
@@ -36,6 +38,7 @@ from src.provider.dto import (
 
 GenerateFn = Callable[..., StageResult[ExtractionOutput]]
 GroundFn = Callable[[EvidenceCandidate, ParsedDocument], GroundingResult]
+logger = logging.getLogger(__name__)
 
 _HEADROOM_FACTOR = 0.8
 _TABLE_SEP_RE = re.compile(r"^\s*\|?(?:\s*:?-{3,}:?\s*\|)+\s*:?-{3,}:?\s*\|?\s*$")
@@ -504,6 +507,7 @@ def _execute_extraction_batch(
     settings: ProviderSettings,
     budget: QuotaBudget | None,
     generate_fn: GenerateFn,
+    run_id: str = "unspecified",
 ) -> tuple[StageResult[ExtractionOutput] | None, ProviderError | None, int]:
     est_in = sum(_estimate_unit_input_tokens(u) for u in batch.units)
     est_out = sum(_estimate_unit_output_tokens(u) for u in batch.units)
@@ -527,6 +531,24 @@ def _execute_extraction_batch(
                 payload = _build_payload(document, batch, repair_hint=EXTRACTION_REPAIR_HINT)
                 continue
             return None, exc, attempts
+        except Exception as exc:
+            log_safe_exception(
+                logger,
+                "extract_batch_unexpected_error",
+                exc,
+                run_id=run_id,
+                stage=PipelineStage.EXTRACT.value,
+            )
+            return (
+                None,
+                ProviderError(
+                    f"Внутренняя ошибка пакета ({type(exc).__name__})",
+                    reason=FailureReason.API_ERROR,
+                    action=FailureAction.STOP,
+                    attempts=max(attempts, 0),
+                ),
+                attempts,
+            )
     return None, None, attempts
 
 
@@ -542,6 +564,7 @@ def extract_requirements(
     include_boundary_context: bool = True,
     max_concurrency: int = 1,
     retry_ungrounded_blocks: bool = False,
+    run_id: str | None = None,
 ) -> ExtractionResult:
     """Extract grounded atomic requirements and per-block coverage in source order."""
     planned_blocks = [block.block_id for block in document.version.blocks]
@@ -582,6 +605,7 @@ def extract_requirements(
     known_out = 0
     has_known_usage = False
     workers = max(1, max_concurrency)
+    diag_run_id = run_id or "unspecified"
 
     def _process_wave(
         wave: list[_ExtractionBatch],
@@ -591,7 +615,7 @@ def extract_requirements(
                 (
                     b,
                     *_execute_extraction_batch(
-                        b, document, settings=settings, budget=budget, generate_fn=generate_fn
+                        b, document, settings=settings, budget=budget, generate_fn=generate_fn, run_id=diag_run_id
                     ),
                 )
                 for b in wave
@@ -607,6 +631,7 @@ def extract_requirements(
                         settings=settings,
                         budget=budget,
                         generate_fn=generate_fn,
+                        run_id=diag_run_id,
                     ),
                 )
                 for b in wave
@@ -624,7 +649,7 @@ def extract_requirements(
                 batch = pending_wave[idx]
                 idx += 1
                 stage_result, exc, batch_attempts = _execute_extraction_batch(
-                    batch, document, settings=settings, budget=budget, generate_fn=generate_fn
+                    batch, document, settings=settings, budget=budget, generate_fn=generate_fn, run_id=diag_run_id
                 )
                 total_attempts += batch_attempts
                 target_ids = list(dict.fromkeys(unit.block.block_id for unit in batch.units))
@@ -816,6 +841,17 @@ def extract_requirements(
                 except ProviderError as exc:
                     total_attempts += max(exc.attempts, 0)
                     incomplete_reasons.append(f"Пакет {repair_batch.batch_id} не завершён: {exc}.")
+                except Exception as exc:
+                    log_safe_exception(
+                        logger,
+                        "extract_repair_unexpected_error",
+                        exc,
+                        run_id=diag_run_id,
+                        stage=PipelineStage.EXTRACT.value,
+                    )
+                    incomplete_reasons.append(
+                        f"Пакет {repair_batch.batch_id} не завершён: Внутренняя ошибка пакета ({type(exc).__name__})."
+                    )
 
     # Determine fully completed blocks first so requirements strictly align with completed blocks
     # (preserving ValidationReport's disjoint cited_blocks | context_blocks == completed_blocks invariant).

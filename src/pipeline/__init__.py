@@ -10,6 +10,8 @@ def run_pipeline(
     document: ParsedDocument,
     settings: ProviderSettings,
     on_progress: Callable[[ProgressEvent], None] | None = None,
+    *,
+    run_id: str | None = None,
 ) -> ValidationReport:
     """Audit an explicitly shareable revision. Notify only on actual stage transitions."""
-    return execute_pipeline(document, settings, on_progress=on_progress)
+    return execute_pipeline(document, settings, on_progress=on_progress, run_id=run_id)

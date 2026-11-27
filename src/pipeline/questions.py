@@ -2,6 +2,7 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 import inspect
+import logging
 import re
 
 from pydantic import Field
@@ -21,6 +22,7 @@ from src.contracts import (
     StageResult,
 )
 from src.contracts.source import Contract, Count, Text
+from src.pipeline.diagnostics import log_safe_exception
 from src.prompts.questions import (
     QUESTIONS_PROMPT_VERSION,
     QUESTIONS_REPAIR_HINT,
@@ -36,6 +38,7 @@ from src.provider.dto import (
 )
 
 GenerateFn = Callable[..., StageResult[QuestionGenerationOutput]]
+logger = logging.getLogger(__name__)
 
 _OPTION_IDS = tuple("ABCDEFGHIJKLMNOPQRSTUVWXYZ")
 _PRIORITY_ORDER = {
@@ -187,6 +190,7 @@ def _execute_question_batch(
     settings: ProviderSettings,
     budget: QuotaBudget | None,
     generate_fn: GenerateFn,
+    run_id: str = "unspecified",
 ) -> tuple[StageResult[QuestionGenerationOutput] | None, ProviderError | None, int]:
     finding_inputs = [
         QuestionFindingInput(
@@ -242,6 +246,24 @@ def _execute_question_batch(
                 payload = _make_payload(repair_hint=QUESTIONS_REPAIR_HINT)
                 continue
             return None, exc, attempts
+        except Exception as exc:
+            log_safe_exception(
+                logger,
+                "clarify_batch_unexpected_error",
+                exc,
+                run_id=run_id,
+                stage=PipelineStage.CLARIFY.value,
+            )
+            return (
+                None,
+                ProviderError(
+                    f"Внутренняя ошибка пакета ({type(exc).__name__})",
+                    reason=FailureReason.API_ERROR,
+                    action=FailureAction.STOP,
+                    attempts=max(attempts, 0),
+                ),
+                attempts,
+            )
     return None, None, attempts
 
 
@@ -255,6 +277,7 @@ def generate_questions(
     include_minor: bool = False,
     batch_size: int = 16,
     max_concurrency: int = 1,
+    run_id: str | None = None,
 ) -> QuestionGenerationResult:
     """Generate stakeholder clarification questions grounded strictly in material findings."""
     findings_by_id = {f.finding_id: f for f in findings}
@@ -285,6 +308,7 @@ def generate_questions(
     known_out = 0
     has_known_usage = False
     workers = max(1, max_concurrency)
+    diag_run_id = run_id or "unspecified"
 
     step = max(1, batch_size)
     pending_wave: list[tuple[str, list[Finding]]] = [
@@ -481,6 +505,7 @@ def generate_questions(
                     settings=settings,
                     budget=budget,
                     generate_fn=generate_fn,
+                    run_id=diag_run_id,
                 )
                 total_attempts += batch_attempts
                 if exc is not None:
@@ -519,6 +544,7 @@ def generate_questions(
                         settings=settings,
                         budget=budget,
                         generate_fn=generate_fn,
+                        run_id=diag_run_id,
                     ),
                 )
                 for bid, b in pending_wave

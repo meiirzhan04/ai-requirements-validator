@@ -30,6 +30,7 @@ from src.contracts import (
     SemanticStatus,
     ValidationReport,
 )
+from src.pipeline.diagnostics import log_safe_exception, new_run_id
 from src.provider import ProviderError
 from src.report import EXECUTION, READINESS, ROLE, SEVERITY
 from ui.components import ProgressTracker, render_evidence_block, run_with_progress
@@ -357,6 +358,7 @@ def _render_bundle_and_revalidation(
         if not settings.api_key:
             st.error("Для повторной проверки требуется ключ Gemini.")
             return
+        reval_run_id = new_run_id()
         with st.status("Повторный анализ рабочей версии", expanded=True) as status:
             tracker = ProgressTracker(status, STAGE, STATE)
             try:
@@ -366,6 +368,7 @@ def _render_bundle_and_revalidation(
                     bundle,
                     settings,
                     runner=pipeline.run_pipeline,
+                    run_id=reval_run_id,
                 )
                 if result.document != child or result.metadata.origin != "live":
                     raise ValueError("Unexpected report version or origin")
@@ -375,12 +378,26 @@ def _render_bundle_and_revalidation(
                     state="error" if result.coverage.execution == "failed" else "complete",
                 )
             except ProviderError as error:
-                logger.warning("ui_revalidation_provider_error reason=%s", error.reason.value)
-                status.update(label=f"Сбой Gemini · {error.reason.value}", state="error")
+                log_safe_exception(
+                    logger,
+                    "ui_revalidation_provider_error",
+                    error,
+                    run_id=reval_run_id,
+                    stage=tracker.last_stage or "revalidation",
+                    level=logging.WARNING,
+                )
+                status.update(label=f"Сбой Gemini · {error.reason.value} (код диагностики: {reval_run_id})", state="error")
             except Exception as error:
-                logger.error("ui_revalidation_internal_error error_type=%s", type(error).__name__)
+                log_safe_exception(
+                    logger,
+                    "ui_revalidation_internal_error",
+                    error,
+                    run_id=reval_run_id,
+                    stage=tracker.last_stage or "revalidation",
+                    level=logging.ERROR,
+                )
                 status.update(
-                    label="Повторная проверка не завершена. Исходный отчёт сохранён.",
+                    label=f"Повторная проверка не завершена (код диагностики: {reval_run_id}). Исходный отчёт сохранён.",
                     state="error",
                 )
 

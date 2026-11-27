@@ -2,6 +2,7 @@
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 import inspect
+import logging
 import re
 
 from pydantic import Field
@@ -19,6 +20,7 @@ from src.contracts import (
     StageResult,
 )
 from src.contracts.source import Contract, Count, Text
+from src.pipeline.diagnostics import log_safe_exception
 from src.prompts.verification import (
     VERIFICATION_PROMPT_VERSION,
     VERIFICATION_REPAIR_HINT,
@@ -35,6 +37,7 @@ from src.provider.dto import (
 )
 
 GenerateFn = Callable[..., StageResult[VerificationOutput]]
+logger = logging.getLogger(__name__)
 
 _STOP_ALL_REASONS = frozenset(
     {
@@ -174,6 +177,7 @@ def _execute_verification_batch(
     settings: ProviderSettings,
     budget: QuotaBudget | None,
     generate_fn: GenerateFn,
+    run_id: str = "unspecified",
 ) -> tuple[StageResult[VerificationOutput] | None, ProviderError | None, int]:
     context_block_ids: set[str] = set()
     cited_sections: set[str] = set()
@@ -278,6 +282,24 @@ def _execute_verification_batch(
                 payload = _make_payload(repair_hint=VERIFICATION_REPAIR_HINT)
                 continue
             return None, exc, attempts
+        except Exception as exc:
+            log_safe_exception(
+                logger,
+                "verify_batch_unexpected_error",
+                exc,
+                run_id=run_id,
+                stage=PipelineStage.VERIFY.value,
+            )
+            return (
+                None,
+                ProviderError(
+                    f"Внутренняя ошибка пакета ({type(exc).__name__})",
+                    reason=FailureReason.API_ERROR,
+                    action=FailureAction.STOP,
+                    attempts=max(attempts, 0),
+                ),
+                attempts,
+            )
     return None, None, attempts
 
 
@@ -292,6 +314,7 @@ def verify_findings(
     generate_fn: GenerateFn = generate,
     batch_size: int = 16,
     max_concurrency: int = 1,
+    run_id: str | None = None,
 ) -> VerificationResult:
     """Verify major/critical finding candidates separately from quote grounding."""
     all_block_ids = [b.block_id for b in document.version.blocks]
@@ -319,6 +342,7 @@ def verify_findings(
     known_out = 0
     has_known_usage = False
     workers = max(1, max_concurrency)
+    diag_run_id = run_id or "unspecified"
 
     step = max(1, batch_size)
     pending_wave: list[tuple[str, list[Finding]]] = [
@@ -365,6 +389,7 @@ def verify_findings(
                     settings=settings,
                     budget=budget,
                     generate_fn=generate_fn,
+                    run_id=diag_run_id,
                 )
                 total_attempts += batch_attempts
                 if exc is not None:
@@ -408,6 +433,7 @@ def verify_findings(
                         settings=settings,
                         budget=budget,
                         generate_fn=generate_fn,
+                        run_id=diag_run_id,
                     ),
                 )
                 for bid, b in pending_wave

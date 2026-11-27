@@ -4,6 +4,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 import inspect
+import logging
 import re
 from typing import Any
 
@@ -32,6 +33,7 @@ from src.contracts import (
 )
 from src.contracts.source import Contract, Count, Id, Text
 from src.evidence import ground
+from src.pipeline.diagnostics import log_safe_exception
 from src.prompts.holistic import (
     HOLISTIC_LOGIC_SYSTEM_PROMPT,
     HOLISTIC_PROMPT_VERSION,
@@ -51,6 +53,7 @@ from src.provider.dto import (
 
 GenerateFn = Callable[..., StageResult[HolisticAuditOutput]]
 GroundFn = Callable[[EvidenceCandidate, ParsedDocument], GroundingResult]
+logger = logging.getLogger(__name__)
 
 _WHOLE_SET_ORDERED = tuple(sorted(WHOLE_SET, key=lambda c: c.value))
 _TOKEN_RE = re.compile(r"[A-Za-zА-Яа-яЁё0-9/_-]{4,}")
@@ -764,6 +767,7 @@ def _execute_holistic_group(
     settings: ProviderSettings,
     budget: QuotaBudget | None,
     generate_fn: GenerateFn,
+    run_id: str = "unspecified",
 ) -> tuple[StageResult[HolisticAuditOutput] | None, ProviderError | None, int, set[str], bool]:
     if group.group_id == "whole-spec":
         scope_candidates = sorted(effective_inspected, key=lambda bid: block_order[bid])
@@ -858,6 +862,26 @@ def _execute_holistic_group(
                 payload = _make_payload(repair_hint=HOLISTIC_REPAIR_HINT)
                 continue
             return None, exc, attempts, group_inspected_set, group_has_uninspected_scope
+        except Exception as exc:
+            log_safe_exception(
+                logger,
+                "holistic_group_unexpected_error",
+                exc,
+                run_id=run_id,
+                stage=PipelineStage.HOLISTIC.value,
+            )
+            return (
+                None,
+                ProviderError(
+                    f"Внутренняя ошибка группы ({type(exc).__name__})",
+                    reason=FailureReason.API_ERROR,
+                    action=FailureAction.STOP,
+                    attempts=max(attempts, 0),
+                ),
+                attempts,
+                group_inspected_set,
+                group_has_uninspected_scope,
+            )
     return None, None, attempts, group_inspected_set, group_has_uninspected_scope
 
 
@@ -875,6 +899,7 @@ def audit_holistic_set(
     max_passages_per_group: int = 120,
     finding_id_start: int = 1,
     max_concurrency: int = 1,
+    run_id: str | None = None,
 ) -> HolisticAuditResult:
     """Audit whole-specification ISO/IEEE properties across cross-section groups."""
     all_block_ids = [b.block_id for b in document.version.blocks]
@@ -921,6 +946,7 @@ def audit_holistic_set(
     has_known_usage = False
     temp_finding_seq = 0
     workers = max(1, max_concurrency)
+    diag_run_id = run_id or "unspecified"
 
     def _consume_group_output(
         group: CrossSectionGroup,
@@ -1059,6 +1085,7 @@ def audit_holistic_set(
                     settings=settings,
                     budget=budget,
                     generate_fn=generate_fn,
+                    run_id=diag_run_id,
                 )
                 total_attempts += grp_attempts
                 if exc is not None:
@@ -1103,6 +1130,7 @@ def audit_holistic_set(
                         settings=settings,
                         budget=budget,
                         generate_fn=generate_fn,
+                        run_id=diag_run_id,
                     ),
                 )
                 for g in pending_wave

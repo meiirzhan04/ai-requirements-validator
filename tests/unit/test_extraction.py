@@ -301,6 +301,114 @@ def test_omitted_block_fuzzy_quote_and_single_malformed_repair():
     assert any("B003" in reason and "пропущен" in reason for reason in result.incomplete_reasons)
 
 
+def test_partially_invalid_block_preserves_completed_block_coverage_invariant():
+    b1 = "Система поддерживает вход по биометрии."
+    b2 = "Лимит операции 500 000 KZT. Комиссия рассчитывается автоматически."
+    document = _doc([("B001", "Вход", b1), ("B002", "Лимиты", b2)])
+
+    def fake_generate(stage, payload: ExtractionBatchPayload, output_type, *, settings=None):
+        return StageResult_ok(
+            ExtractionOutput(
+                items=[
+                    ExtractedItem(
+                        block_id="B001",
+                        original_quote=b1,
+                        summary="Поддержка биометрии.",
+                    ),
+                    # B002 has one valid quote AND one ungrounded quote -> B002 must stay incomplete
+                    # and must not leave dangling requirements outside completed_blocks!
+                    ExtractedItem(
+                        block_id="B002",
+                        original_quote="Лимит операции 500 000 KZT.",
+                        summary="Лимит операции 500 000 KZT.",
+                    ),
+                    ExtractedItem(
+                        block_id="B002",
+                        original_quote="Несуществующая цитата о комиссии",
+                        summary="Комиссия.",
+                    ),
+                ]
+            )
+        )
+
+    result = extract_requirements(
+        document,
+        _settings(),
+        generate_fn=fake_generate,
+        ground_fn=_exact_ground,
+    )
+
+    cited = {r.source.block_id for r in result.requirements}
+    completed = set(result.extraction_blocks.completed)
+    context = set(result.context_blocks)
+    assert completed == {"B001"}
+    assert cited | context == completed
+    assert not (cited & context)
+    assert any("B002" in r for r in result.incomplete_reasons)
+
+
+def test_permanent_provider_stop_preserves_prior_batches_and_marks_rest_incomplete():
+    document = _doc(
+        [
+            ("B001", "Раздел 1", "Правило один: обязательная проверка подписи транзакции перед отправкой."),
+            ("B002", "Раздел 2", "Правило два: при ошибке валидации возвращать HTTP 400 с кодом поля."),
+            ("B003", "Раздел 3", "Правило три: хранить журнал аудита операций не менее 5 лет."),
+        ]
+    )
+    calls = 0
+
+    def fake_generate(stage, payload: ExtractionBatchPayload, output_type, *, settings=None):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            items = [
+                ExtractedItem(block_id=b.block_id, original_quote=b.text, summary=f"Правило {b.block_id}.")
+                for b in payload.blocks
+                if b.is_target
+            ]
+            return StageResult_ok(ExtractionOutput(items=items))
+        raise ProviderError(
+            "Request attempt budget exhausted",
+            reason=FailureReason.BUDGET_EXHAUSTED,
+            action=FailureAction.STOP,
+            attempts=0,
+        )
+
+    result = extract_requirements(
+        document,
+        _settings(),
+        generate_fn=fake_generate,
+        ground_fn=_exact_ground,
+        max_input_tokens=450,
+        max_output_tokens=200,
+    )
+
+    assert calls == 2
+    assert len(result.extraction_blocks.completed) >= 1
+    assert not result.extraction_blocks.complete
+    assert {r.source.block_id for r in result.requirements} == set(result.extraction_blocks.completed)
+    assert any("budget exhausted" in r.lower() for r in result.incomplete_reasons)
+
+
+def test_empty_document_returns_incomplete_diagnostic():
+    empty_doc = ParsedDocument(
+        version=DocumentVersion(
+            sha256=SHA,
+            parser_version="test-v1",
+            name="empty.pdf",
+            format=DocumentFormat.PDF,
+            page_count=1,
+            blocks=[],
+        ),
+        unread_pages=[1],
+        diagnostics=["Страница 1: графическая страница без извлекаемого текста."],
+    )
+    result = extract_requirements(empty_doc, _settings(), generate_fn=lambda *a, **k: pytest.fail("no call"))
+    assert result.requirements == []
+    assert result.attempts == 0
+    assert result.incomplete_reasons
+
+
 def StageResult_ok(output: ExtractionOutput):
     from src.contracts import StageResult
 

@@ -15,6 +15,5 @@ private/
 tmp/
 *.tmp
 *.log
-docs/requirements.md
 docs/requirements.pdf
 .streamlit/secrets.toml

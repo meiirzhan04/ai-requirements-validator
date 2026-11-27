@@ -3,24 +3,24 @@
   "cases": [
     {
       "case": "defective",
-      "cli_exit_code": 2,
+      "cli_exit_code": 0,
       "evaluation": {
         "case": "defective",
         "format": "markdown",
         "run": {
-          "run_id": "run-99d074504f99",
+          "run_id": "run-ad41a97167f1",
           "document_version": "7fa1c24181e5e8d3cf4c06d76e31d76bb12310eaada91176013c9ef05585ed35",
-          "started_at": "2026-11-27T07:32:35.046222Z",
+          "started_at": "2026-11-27T09:39:05.605807Z",
           "model": "gemini-3.5-flash-lite",
-          "agent_revision": "4337c57",
-          "prompt_version": "pipeline-v1",
+          "agent_revision": "7b9ec33",
+          "prompt_version": "pipeline-v2",
           "origin": "live",
-          "duration_seconds": 26.156,
-          "request_attempts": 5,
-          "input_tokens": 5017,
-          "output_tokens": 4372
+          "duration_seconds": 15.703,
+          "request_attempts": 7,
+          "input_tokens": 5104,
+          "output_tokens": 5288
         },
-        "execution": "partial",
+        "execution": "complete",
         "readiness": "no_go",
         "input_documents": 1,
         "grounding": {
@@ -35,14 +35,14 @@
             "value": 1.0
           },
           "individual_requirements": {
-            "numerator": 2,
+            "numerator": 3,
             "denominator": 3,
-            "value": 0.6666666666666666
+            "value": 1.0
           },
           "audit_batches": {
-            "numerator": 1,
+            "numerator": 2,
             "denominator": 2,
-            "value": 0.5
+            "value": 1.0
           },
           "cross_section_groups": {
             "numerator": 1,
@@ -50,11 +50,7 @@
             "value": 1.0
           }
         },
-        "incomplete_reasons": [
-          "Находка K1 (R003): противоречие требует две независимые подтверждённые цитаты.",
-          "Индивидуальный аудит завершён для 2 из 3 требований.",
-          "Завершено пакетов индивидуального аудита: 0 из 1."
-        ],
+        "incomplete_reasons": [],
         "requirement_recall": null,
         "finding_precision": null,
         "finding_recall": null,
@@ -71,17 +67,17 @@
         "case": "clean",
         "format": "markdown",
         "run": {
-          "run_id": "run-c409da6fd9df",
+          "run_id": "run-f72385bab960",
           "document_version": "2c319e36fa5dcd529cfe60d21e890e98700a2006cbb4573e9200931462eb26bf",
-          "started_at": "2026-11-27T07:33:02.275403Z",
+          "started_at": "2026-11-27T09:39:22.656771Z",
           "model": "gemini-3.5-flash-lite",
-          "agent_revision": "4337c57",
-          "prompt_version": "pipeline-v1",
+          "agent_revision": "7b9ec33",
+          "prompt_version": "pipeline-v2",
           "origin": "live",
-          "duration_seconds": 9.0,
+          "duration_seconds": 6.656,
           "request_attempts": 3,
-          "input_tokens": 2984,
-          "output_tokens": 2506
+          "input_tokens": 3124,
+          "output_tokens": 3207
         },
         "execution": "complete",
         "readiness": "go",
@@ -130,20 +126,20 @@
         "case": "untrusted",
         "format": "markdown",
         "run": {
-          "run_id": "run-7592e5a01cd5",
+          "run_id": "run-d8c4a53d355b",
           "document_version": "f9a2eeeaeadaeb8cabfa535dbdffdcaf5be65d586501552c02bad1fc6aaaf48c",
-          "started_at": "2026-11-27T07:33:12.244394Z",
+          "started_at": "2026-11-27T09:44:54.428363Z",
           "model": "gemini-3.5-flash-lite",
-          "agent_revision": "4337c57",
-          "prompt_version": "pipeline-v1",
+          "agent_revision": "c8c52da",
+          "prompt_version": "pipeline-v2",
           "origin": "live",
-          "duration_seconds": 12.531,
-          "request_attempts": 5,
-          "input_tokens": 4125,
-          "output_tokens": 2770
+          "duration_seconds": 8.765,
+          "request_attempts": 4,
+          "input_tokens": 3013,
+          "output_tokens": 3680
         },
         "execution": "complete",
-        "readiness": "undetermined",
+        "readiness": "go",
         "input_documents": 1,
         "grounding": {
           "numerator": 1,

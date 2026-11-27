@@ -800,12 +800,18 @@ def extract_requirements(
                         incomplete_reasons = [
                             r for r in incomplete_reasons if not any(f"Блок {bid} " in r for bid in recovered)
                         ]
-                        # Mark original batches complete if all their blocks are now recovered.
+                        # Mark original batches complete and clear superseded failure messages
+                        # if all their blocks were cleanly recovered by the repair pass.
                         for orig_batch in queue:
                             if orig_batch.batch_id not in completed_batches:
                                 orig_ids = {u.block.block_id for u in orig_batch.units}
                                 if orig_ids and not (orig_ids & block_failed):
                                     completed_batches.append(orig_batch.batch_id)
+                                    incomplete_reasons = [
+                                        r
+                                        for r in incomplete_reasons
+                                        if not r.startswith(f"Пакет {orig_batch.batch_id} ")
+                                    ]
                     incomplete_reasons.extend(repair_reasons)
                 except ProviderError as exc:
                     total_attempts += max(exc.attempts, 0)

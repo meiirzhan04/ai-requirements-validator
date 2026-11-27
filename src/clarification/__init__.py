@@ -5,6 +5,55 @@ from src.contracts import (
 )
 from src.ingest import MAX_BYTES, parse
 
+from .exporter import (
+    ChangeLogEntry,
+    DocumentChangeLog,
+    ImprovedDocumentBundle,
+    apply_changes,
+    export_improved_markdown,
+    render_blocks_to_markdown,
+    render_change_log_markdown,
+    revalidate_improved_document,
+)
+from .improvement import (
+    ImprovementContextBlock,
+    ImprovementGenerateFn,
+    ImprovementRequestPayload,
+    ImprovementRewriteOutput,
+    ProposalOrigin,
+    ProposalStatus,
+    RemediationProposal,
+    approve_proposal,
+    draft_remediation_proposal,
+    draft_remediation_proposals,
+    reject_proposal,
+)
+
+__all__ = [
+    "ChangeLogEntry",
+    "DocumentChangeLog",
+    "ImprovedDocumentBundle",
+    "ImprovementContextBlock",
+    "ImprovementGenerateFn",
+    "ImprovementRequestPayload",
+    "ImprovementRewriteOutput",
+    "ProposalOrigin",
+    "ProposalStatus",
+    "RemediationProposal",
+    "apply_change",
+    "apply_changes",
+    "approve_proposal",
+    "draft_remediation_proposal",
+    "draft_remediation_proposals",
+    "export_improved_markdown",
+    "propose_change",
+    "reject_proposal",
+    "render_blocks_to_markdown",
+    "render_change_log_markdown",
+    "revalidate_improved_document",
+    "working_document",
+]
+
 
 def _checked_block(version: DocumentVersion, ref: EvidenceRef):
     if version.sha256 != ref.version:

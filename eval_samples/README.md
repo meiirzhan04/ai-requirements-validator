@@ -5,6 +5,7 @@
 ```powershell
 python -m eval_samples.prepare --out output/eval
 python -m eval_samples.evaluate output/eval/official.md output/official.json
+python -m eval_samples.evaluate output/eval/official.md output/official.json --init-review > output/official-review.json
 python -m eval_samples.evaluate output/eval/official.pdf output/pdf.json --review output/pdf-review.json
 ```
 

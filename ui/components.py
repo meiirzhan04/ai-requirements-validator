@@ -1,6 +1,12 @@
-"""Reusable Enterprise Fintech UI components and real ProgressEvent tracker."""
+"""Reusable Enterprise Fintech UI components and thread-safe ProgressEvent tracker."""
+from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor
 import html
+import logging
+import queue
+import threading
 import time
+from typing import TypeVar
 
 import streamlit as st
 
@@ -8,6 +14,9 @@ from src.contracts import EvidenceRef, ProgressEvent, SourceBlock, ValidationRep
 from src.report import EXECUTION, GROUNDING, READINESS
 from ui.state import ReportView
 from ui.theme import EXECUTION_TOKENS, READINESS_TOKENS
+
+logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 WORKFLOW_STEPS = (
     (1, "Загрузка"),
@@ -101,13 +110,23 @@ def render_executive_verdict(report: ValidationReport, *, origin: str, view: Rep
     else:
         exec_note = "Пригодная оценка не получена. Подробности указаны во вкладке покрытия."
 
+    rationale_full = report.verdict.rationale
+    rationale_brief = rationale_full
+    has_long_rationale = len(rationale_full) > 280
+    if has_long_rationale:
+        first_break = rationale_full.find(". ", 40, 260)
+        if first_break > 0:
+            rationale_brief = rationale_full[: first_break + 1]
+        else:
+            rationale_brief = rationale_full[:260].rstrip() + "…"
+
     st.caption(origin)
     st.markdown(
         '<div class="rv-exec-grid">'
         f'<div class="rv-verdict-box" style="background:{r_tok["tint"]};border-color:{r_tok["border"]};border-left-color:{r_tok["accent"]};">'
         f'<div class="rv-kicker" style="color:{r_tok["accent"]};">Вердикт готовности документа · {html.escape(r_tok["label"])}</div>'
         f'<div class="rv-verdict-value">{html.escape(READINESS[readiness])}</div>'
-        f'<div class="rv-exec-detail">{html.escape(report.verdict.rationale)}</div>'
+        f'<div class="rv-exec-detail">{html.escape(rationale_brief)}</div>'
         "</div>"
         f'<div class="rv-exec-box" style="background:{e_tok["tint"]};border-left-color:{e_tok["accent"]};">'
         f'<div class="rv-kicker" style="color:{e_tok["accent"]};">Полнота выполнения аудита</div>'
@@ -125,6 +144,13 @@ def render_executive_verdict(report: ValidationReport, *, origin: str, view: Rep
         "</div>",
         unsafe_allow_html=True,
     )
+    if has_long_rationale or view.diagnostics:
+        with st.expander("Подробное обоснование вердикта и техническая диагностика", expanded=False):
+            st.text(rationale_full)
+            if view.diagnostics:
+                st.caption(f"Уникальные диагностические записи и неопределённости ({len(view.diagnostics)})")
+                for item in view.diagnostics:
+                    st.text(f"• {item}")
     st.text(f"{version.name}  ·  {meta.started_at:%d.%m.%Y %H:%M %z}  ·  {meta.model}")
 
 
@@ -191,13 +217,16 @@ def render_remediation_panel(report: ValidationReport) -> None:
 
 
 class ProgressTracker:
-    """Render actual elapsed time, active stage, completed stages, and retry notices from ProgressEvent."""
+    """Thread-safe ProgressEvent renderer that only mutates Streamlit widgets on the script thread."""
 
     def __init__(self, status_container, stage_labels: dict[str, str], state_labels: dict[str, str]) -> None:
         self._status = status_container
         self._stage_labels = stage_labels
         self._state_labels = state_labels
         self._started = time.monotonic()
+        self._owner_thread_id = threading.get_ident()
+        self._lock = threading.Lock()
+        self._pending: queue.SimpleQueue[ProgressEvent] = queue.SimpleQueue()
         self._summary_slot = status_container.empty()
         self._stages: dict[str, tuple[str, str, float]] = {}
         self.events: list[ProgressEvent] = []
@@ -207,7 +236,7 @@ class ProgressTracker:
     def elapsed_seconds(self) -> float:
         return max(0.0, time.monotonic() - self._started)
 
-    def handle(self, event: ProgressEvent) -> None:
+    def _render_event(self, event: ProgressEvent) -> None:
         elapsed = self.elapsed_seconds
         self.events.append(event)
         stage_key = str(event.stage)
@@ -219,31 +248,83 @@ class ProgressTracker:
         if any(hint in lower_msg for hint in _RETRY_HINTS):
             self.retry_notices.append(f"{stage_name}: {event.message}")
 
-        # Emit plain factual stage line for visibility and deterministic test assertions.
-        self._status.text(f"{stage_name} · {state_name} ({elapsed:.1f} с) — {event.message}")
-
         completed = sum(1 for st_val, _, _ in self._stages.values() if st_val == "completed")
         rows = []
-        for key, (st_val, msg, ts) in self._stages.items():
+        for key, (st_val, _msg, ts) in self._stages.items():
             label = self._stage_labels.get(key, key)
             st_ru = self._state_labels.get(st_val, st_val)
             rows.append(
                 f'<div class="rv-stage-row"><span><strong>{html.escape(label)}</strong> · {html.escape(st_ru)}</span>'
-                f'<span>{ts:.1f} с</span></div>'
+                f"<span>{ts:.1f} с</span></div>"
             )
         retry_html = ""
         if self.retry_notices:
             retry_html = (
-                f'<div style="margin-top:0.4rem;font-size:0.8rem;color:#B45309;">'
+                '<div style="margin-top:0.4rem;font-size:0.8rem;color:#B45309;">'
                 f"Ожидание / повтор провайдера: {html.escape(self.retry_notices[-1])}</div>"
             )
-        self._summary_slot.markdown(
-            f'<div style="font-size:0.82rem;color:var(--rv-muted);">'
-            f"Фактическое время: <strong>{elapsed:.1f} с</strong> · "
-            f"Завершено этапов: <strong>{completed}</strong> · "
-            f"Активный этап: <strong>{html.escape(stage_name)}</strong>"
-            f"</div>"
-            f'<div class="rv-stage-list">{"".join(rows)}</div>'
-            f"{retry_html}",
-            unsafe_allow_html=True,
-        )
+        try:
+            # Emit plain factual stage line for visibility and deterministic test assertions.
+            self._status.text(f"{stage_name} · {state_name} ({elapsed:.1f} с) — {event.message}")
+            self._summary_slot.markdown(
+                '<div style="font-size:0.82rem;color:var(--rv-muted);">'
+                f"Фактическое время: <strong>{elapsed:.1f} с</strong> · "
+                f"Завершено этапов: <strong>{completed}</strong> · "
+                f"Активный этап: <strong>{html.escape(stage_name)}</strong>"
+                "</div>"
+                f'<div class="rv-stage-list">{"".join(rows)}</div>'
+                f"{retry_html}",
+                unsafe_allow_html=True,
+            )
+        except Exception as exc:
+            # Never allow transient UI rendering issues to abort backend processing.
+            logger.warning("ui_progress_render_failed stage=%s error_type=%s", stage_key, type(exc).__name__)
+
+    def flush(self) -> None:
+        """Drain queued worker-thread events strictly on the owning Streamlit script thread."""
+        if threading.get_ident() != self._owner_thread_id:
+            return
+        with self._lock:
+            while True:
+                try:
+                    pending_event = self._pending.get_nowait()
+                except queue.Empty:
+                    break
+                self._render_event(pending_event)
+
+    def handle(self, event: ProgressEvent) -> None:
+        if threading.get_ident() != self._owner_thread_id:
+            self._pending.put(event)
+            return
+        self.flush()
+        with self._lock:
+            self._render_event(event)
+
+
+def run_with_progress(tracker: ProgressTracker, fn: Callable[..., T], *args, **kwargs) -> T:
+    """Execute a blocking pipeline call in a worker thread and render ProgressEvents on the script thread."""
+    event_queue: queue.SimpleQueue[ProgressEvent] = queue.SimpleQueue()
+
+    def _enqueue(event: ProgressEvent) -> None:
+        event_queue.put(event)
+
+    def _drain() -> None:
+        while True:
+            try:
+                queued = event_queue.get_nowait()
+            except queue.Empty:
+                break
+            tracker.handle(queued)
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="rv-pipeline") as pool:
+        future = pool.submit(fn, *args, on_progress=_enqueue, **kwargs)
+        while not future.done():
+            try:
+                queued = event_queue.get(timeout=0.05)
+                tracker.handle(queued)
+            except queue.Empty:
+                pass
+            _drain()
+        _drain()
+        tracker.flush()
+        return future.result()

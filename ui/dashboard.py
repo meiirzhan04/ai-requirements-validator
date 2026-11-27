@@ -1,6 +1,8 @@
 """Enterprise Fintech Streamlit dashboard for static requirements validation."""
 from hashlib import sha256
 import html
+import logging
+from pathlib import Path
 
 import streamlit as st
 
@@ -25,7 +27,10 @@ from ui.components import (
     render_executive_verdict,
     render_remediation_panel,
     render_severity_summary,
+    run_with_progress,
 )
+
+logger = logging.getLogger(__name__)
 from ui.state import (
     get_report_exports,
     get_report_view,
@@ -111,7 +116,7 @@ def analyze() -> ValidationReport | None:
 
         data = upload.getvalue() if upload is not None else b""
         digest = sha256(data).hexdigest()
-        filename = upload.name if upload is not None else ""
+        filename = Path(upload.name).name if upload is not None else ""
         sync_active_document("analyze", f"{digest}:{filename}")
         key = (digest, filename, model, timeout, _rules_version())
         history = st.session_state.setdefault("runs", {})
@@ -157,24 +162,23 @@ def analyze() -> ValidationReport | None:
             return None
         with st.status("Обработка документа", expanded=True) as status:
             tracker = ProgressTracker(status, STAGE, STATE)
-
-            def progress(event: ProgressEvent) -> None:
-                tracker.handle(event)
-
             try:
                 document = ingest.parse(filename, data)
                 configured = ProviderSettings(api_key=settings.api_key, model=model, timeout_ms=timeout)
-                result = pipeline.run_pipeline(document, configured, on_progress=progress)
+                result = run_with_progress(tracker, pipeline.run_pipeline, document, configured)
                 if result.metadata.origin != "live" or result.document.version.sha256 != digest:
                     raise ValueError("Report identity mismatch")
             except ProviderError as error:
+                logger.warning("ui_analyze_provider_error reason=%s", error.reason.value)
                 failures[key] = f"Сбой Gemini · {error.reason.value}"
             except NotImplementedError:
                 failures[key] = "Модуль обработки ещё не подключён"
-            except (ValueError, OSError):
+            except (ValueError, OSError) as error:
+                logger.warning("ui_analyze_input_error error_type=%s", type(error).__name__)
                 failures[key] = "Проверка прервана. Проверьте формат и целостность документа."
-            except Exception:
+            except Exception as error:
                 # Provider and parser exceptions may include credentials or private input.
+                logger.error("ui_analyze_internal_error error_type=%s", type(error).__name__)
                 failures[key] = "Внутренняя ошибка обработки документа"
             if key in failures:
                 status.update(label=failures[key], state="error")

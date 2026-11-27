@@ -5,6 +5,7 @@ from contextlib import nullcontext
 from datetime import datetime, timezone
 from functools import lru_cache
 import logging
+import queue
 import subprocess
 import threading
 import time
@@ -360,11 +361,23 @@ def execute_pipeline(
     )
     emit_lock = threading.Lock()
 
-    def _safe_emit(stage: PipelineStage, state: str, message: str) -> None:
+    def _safe_emit_event(event: ProgressEvent) -> None:
         if on_progress is None:
             return
-        with emit_lock:
-            on_progress(ProgressEvent(stage=stage, state=state, message=message))
+        try:
+            with emit_lock:
+                on_progress(event)
+        except Exception as exc:
+            # Progress rendering failures must never abort a healthy validation run or leak private content.
+            logger.warning(
+                "run=%s stage=%s progress_callback_failed error_type=%s",
+                active_run_id,
+                event.stage.value,
+                type(exc).__name__,
+            )
+
+    def _safe_emit(stage: PipelineStage, state: str, message: str) -> None:
+        _safe_emit_event(ProgressEvent(stage=stage, state=state, message=message))
 
     blocks = document.version.blocks
     block_order = {b.block_id: idx for idx, b in enumerate(blocks)}
@@ -530,9 +543,11 @@ def execute_pipeline(
             audit_batches = extraction.batches
             cross_section_groups = WorkSet(planned=[], completed=[])
         else:
-            def _run_individual() -> IndividualAuditResult:
+            def _run_individual(
+                emit_fn: Callable[[PipelineStage, str, str], None] = _safe_emit,
+            ) -> IndividualAuditResult:
                 t0 = time.monotonic()
-                _safe_emit(
+                emit_fn(
                     PipelineStage.INDIVIDUAL,
                     "started",
                     f"Индивидуальный аудит {len(requirements)} требований по 9 критериям ISO 29148.",
@@ -559,7 +574,7 @@ def execute_pipeline(
                     len(res.findings),
                     res.attempts,
                 )
-                _safe_emit(
+                emit_fn(
                     PipelineStage.INDIVIDUAL,
                     "completed" if res.individual_requirements.completed else "failed",
                     f"Индивидуальный аудит: {len(res.individual_requirements.completed)}/"
@@ -567,9 +582,11 @@ def execute_pipeline(
                 )
                 return res
 
-            def _run_holistic() -> HolisticAuditResult:
+            def _run_holistic(
+                emit_fn: Callable[[PipelineStage, str, str], None] = _safe_emit,
+            ) -> HolisticAuditResult:
                 t0 = time.monotonic()
-                _safe_emit(
+                emit_fn(
                     PipelineStage.HOLISTIC,
                     "started",
                     f"Целостный аудит набора из {len(requirements)} требований (ISO 29148 / IEEE 830).",
@@ -595,7 +612,7 @@ def execute_pipeline(
                     len(res.findings),
                     res.attempts,
                 )
-                _safe_emit(
+                emit_fn(
                     PipelineStage.HOLISTIC,
                     "completed" if res.cross_section_groups.completed else "failed",
                     f"Целостный аудит: групп {len(res.cross_section_groups.completed)}/"
@@ -604,10 +621,32 @@ def execute_pipeline(
                 return res
 
             # Stages 3 & 4 have zero data dependency on each other once requirements are extracted.
+            # Deliver worker progress strictly on the caller's thread via a thread-safe queue so
+            # UI frameworks like Streamlit never receive callbacks from worker threads.
             if effective_concurrency > 1:
+                stage_events: queue.SimpleQueue[ProgressEvent] = queue.SimpleQueue()
+
+                def _enqueue_worker_event(stage: PipelineStage, state: str, message: str) -> None:
+                    stage_events.put(ProgressEvent(stage=stage, state=state, message=message))
+
+                def _drain_stage_events() -> None:
+                    while True:
+                        try:
+                            _safe_emit_event(stage_events.get_nowait())
+                        except queue.Empty:
+                            break
+
                 with ThreadPoolExecutor(max_workers=2) as stage_pool:
-                    indiv_fut = stage_pool.submit(_run_individual)
-                    holistic_fut = stage_pool.submit(_run_holistic)
+                    indiv_fut = stage_pool.submit(_run_individual, _enqueue_worker_event)
+                    holistic_fut = stage_pool.submit(_run_holistic, _enqueue_worker_event)
+                    while not (indiv_fut.done() and holistic_fut.done()):
+                        try:
+                            event = stage_events.get(timeout=0.05)
+                            _safe_emit_event(event)
+                        except queue.Empty:
+                            pass
+                        _drain_stage_events()
+                    _drain_stage_events()
                     indiv = indiv_fut.result()
                     holistic = holistic_fut.result()
             else:
@@ -787,13 +826,17 @@ def execute_pipeline(
         f"готовность={report.verdict.readiness.value}, "
         f"нарушений={report.statistics.violations}, вопросов={report.statistics.questions}.",
     )
+    metrics_fn = getattr(active_budget, "metrics_snapshot", None)
+    telemetry = metrics_fn() if callable(metrics_fn) else {}
     logger.info(
-        "run=%s stage=done execution=%s readiness=%s attempts=%d duration=%.3fs rate_wait=%.2fs retry_wait=%.2fs",
+        "run=%s stage=done execution=%s readiness=%s attempts=%d retries=%d duration=%.3fs api_latency=%.2fs rate_wait=%.2fs retry_wait=%.2fs",
         active_run_id,
         report.coverage.execution.value,
         report.verdict.readiness.value,
         report.metadata.request_attempts,
+        int(telemetry.get("retry_attempts", 0)),
         report.metadata.duration_seconds,
+        float(telemetry.get("api_latency_seconds", 0.0)),
         active_budget.rate_limit_wait_seconds,
         active_budget.retry_wait_seconds,
     )

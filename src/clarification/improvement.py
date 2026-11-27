@@ -32,7 +32,9 @@ ProposalStatus = Literal["draft", "approved", "rejected", "needs_clarification"]
 ProposalOrigin = Literal["ai_assisted", "stakeholder_decision", "deterministic_fallback"]
 
 _REQ_ID_PATTERN = re.compile(
-    r"\b(?:FR|NFR|BR|REQ|UC|AC|API|SEC|DR|TR|QR|US|R|F)-\d+[A-Za-z0-9._-]*\b"
+    r"(?<![A-Za-zА-Яа-яЁё0-9])"
+    r"(?:(?:FR|NFR|BR|REQ|UC|AC|API|SEC|DR|TR|QR|US|R|F)|[А-ЯЁ]{1,3})-\d+[A-Za-zА-Яа-яЁё0-9._-]*"
+    r"(?![A-Za-zА-Яа-яЁё0-9])"
 )
 _APPROVAL_REQUIRED_KINDS = frozenset({FindingType.MISSING_INFORMATION, FindingType.CONTRADICTION})
 

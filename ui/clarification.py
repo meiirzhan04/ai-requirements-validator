@@ -7,8 +7,10 @@ from src import pipeline
 from src.clarification import propose_change, working_document
 from src.contracts import Answer, ExecutionStatus, ProposedChange, ProviderSettings, ValidationReport
 from src.provider import ProviderError
-from src.report import EXECUTION, READINESS, ROLE, render_json, render_markdown
+from src.report import EXECUTION, READINESS, ROLE
+from ui.components import ProgressTracker, render_evidence_block
 from ui.dashboard import STAGE, STATE, _rules_version
+from ui.state import get_report_exports, get_report_view
 
 
 def recheck_summary(previous, question, change, result):
@@ -93,15 +95,24 @@ def recheck_diff(previous: ValidationReport, result: ValidationReport) -> list[d
 
 
 def render_clarification(report: ValidationReport, settings: ProviderSettings) -> None:
+    """Render stakeholder question queue, side-by-side citations, editable patch preview, and revalidation."""
     if not report.questions:
         return
     st.divider()
-    st.subheader("Центр уточнения требований и повторной проверки")
+    st.markdown(
+        '<p class="rv-section-title">Центр уточнения требований и повторной проверки</p>'
+        '<p class="rv-section-sub">Выберите вопрос, зафиксируйте решение стейкхолдера, проверьте правку '
+        "до и после, примените к рабочей копии и подтвердите устранение полным повторным анализом.</p>",
+        unsafe_allow_html=True,
+    )
+
     version = report.document.version
+    view = get_report_view(report)
+    blocks = view.blocks_by_id
     scope = (version.sha256, report.metadata.run_id, report.metadata.model, report.metadata.prompt_version)
     prefix = "clarify-" + sha256(repr(scope).encode()).hexdigest()
 
-    f_col1, f_col2 = st.columns(2)
+    f_col1, f_col2 = st.columns([1.0, 1.4], gap="medium")
     priorities = sorted({q.priority for q in report.questions})
     priority = f_col1.selectbox("Приоритет вопроса", ["Все", *priorities], key=prefix + "-priority")
     roles = sorted({q.stakeholder for q in report.questions})
@@ -144,71 +155,73 @@ def render_clarification(report: ValidationReport, settings: ProviderSettings) -
         for finding in report.findings:
             if finding.kind == "contradiction" and finding.finding_id in q.finding_ids:
                 refs.update((r.anchor, r) for r in finding.evidence)
-        cols = st.columns(min(2, len(refs)))
-        locations = {b.block_id: b.location for b in version.blocks}
+        cols = st.columns(min(2, len(refs)), gap="medium")
         for index, ref in enumerate(refs.values()):
-            col = cols[index % len(cols)]
-            loc = locations[ref.block_id]
-            position = f"стр. {loc.page}" if loc.page else f"строки {loc.line_start}–{loc.line_end}"
-            col.caption(f"{loc.section} · {position} · {ref.block_id} [{ref.start}, {ref.end})")
-            col.code(ref.quote, language=None, wrap_lines=True)
+            render_evidence_block(
+                ref,
+                blocks,
+                container=cols[index % len(cols)],
+                tag=f"Цитата {index + 1}" if len(refs) > 1 else None,
+            )
 
-    options = {o.option_id: o for o in q.options}
-    custom_sentinel = "__custom__"
-    choice = st.radio(
-        "Ответ владельца",
-        [*options, custom_sentinel],
-        format_func=lambda i: options[i].label if i != custom_sentinel else "Свой ответ",
-        key=key + "-choice",
-    )
-    custom = None
-    option_id = None if choice == custom_sentinel else choice
-    if option_id is None:
-        custom = st.text_area("Свой ответ", key=key + "-custom").strip()
-        if not custom:
-            return
-    else:
-        st.caption("Последствия выбранного решения")
-        st.text(options[option_id].consequence)
+    with st.container(border=True):
+        options = {o.option_id: o for o in q.options}
+        custom_sentinel = "__custom__"
+        choice = st.radio(
+            "Ответ владельца",
+            [*options, custom_sentinel],
+            format_func=lambda i: options[i].label if i != custom_sentinel else "Свой ответ",
+            key=key + "-choice",
+        )
+        custom = None
+        option_id = None if choice == custom_sentinel else choice
+        if option_id is None:
+            custom = st.text_area("Свой ответ", key=key + "-custom").strip()
+            if not custom:
+                return
+        else:
+            st.caption("Последствия выбранного решения")
+            st.text(options[option_id].consequence)
 
-    answer = Answer(version=version.sha256, question_id=q.question_id, option_id=option_id, custom_text=custom)
-    try:
-        draft = propose_change(answer, report)
-    except ValueError:
-        st.warning("Нельзя подготовить изменение для выбранного ответа и источника.")
-        return
-
-    target = st.selectbox(
-        "Изменяемый фрагмент",
-        q.evidence,
-        format_func=lambda r: f"{r.block_id} [{r.start}, {r.end})",
-        index=q.evidence.index(draft.source),
-        key=key + "-target",
-    )
-    edit_key = key + "-" + sha256((answer.model_dump_json() + repr(target.anchor)).encode()).hexdigest()
-    before, after = st.columns(2)
-    before.caption("До изменения")
-    before.code(target.quote, language=None, wrap_lines=True)
-    replacement = after.text_area(
-        "После изменения",
-        draft.replacement,
-        key=edit_key + "-edit",
-        help="Введите полную формулировку требования или критерия приёмки.",
-    )
-    current = st.session_state.get(key + "-applied")
-    if st.button(
-        "Применить к рабочей копии",
-        key=key + "-apply",
-        disabled=not replacement.strip() or replacement == target.quote,
-    ):
+        answer = Answer(version=version.sha256, question_id=q.question_id, option_id=option_id, custom_text=custom)
         try:
-            change = ProposedChange(question_id=q.question_id, source=target, replacement=replacement)
-            child = working_document(report.document, change)
+            draft = propose_change(answer, report)
         except ValueError:
-            st.error("Изменение не применено. Проверьте исходную версию, цитату и размер правки.")
+            st.warning("Нельзя подготовить изменение для выбранного ответа и источника.")
             return
-        current = (answer, change, child)
-        st.session_state[key + "-applied"] = current
+
+        target = st.selectbox(
+            "Изменяемый фрагмент",
+            q.evidence,
+            format_func=lambda r: f"{r.block_id} [{r.start}, {r.end})",
+            index=q.evidence.index(draft.source),
+            key=key + "-target",
+        )
+        edit_key = key + "-" + sha256((answer.model_dump_json() + repr(target.anchor)).encode()).hexdigest()
+        before, after = st.columns(2, gap="medium")
+        before.caption("До изменения")
+        before.code(target.quote, language=None, wrap_lines=True)
+        replacement = after.text_area(
+            "После изменения",
+            draft.replacement,
+            key=edit_key + "-edit",
+            help="Введите полную формулировку требования или критерия приёмки.",
+        )
+        current = st.session_state.get(key + "-applied")
+        if st.button(
+            "Применить к рабочей копии",
+            key=key + "-apply",
+            disabled=not replacement.strip() or replacement == target.quote,
+        ):
+            try:
+                change = ProposedChange(question_id=q.question_id, source=target, replacement=replacement)
+                child = working_document(report.document, change)
+            except ValueError:
+                st.error("Изменение не применено. Проверьте исходную версию, цитату и размер правки.")
+                return
+            current = (answer, change, child)
+            st.session_state[key + "-applied"] = current
+
     if current is None:
         return
 
@@ -245,17 +258,18 @@ def render_clarification(report: ValidationReport, settings: ProviderSettings) -
             st.error("Для повторной проверки требуется ключ Gemini.")
             return
         with st.status("Повторный анализ рабочей версии", expanded=True) as status:
+            tracker = ProgressTracker(status, STAGE, STATE)
             try:
                 result = pipeline.run_pipeline(
                     child,
                     settings,
-                    on_progress=lambda e: status.text(f"{STAGE[e.stage]} · {STATE[e.state]} — {e.message}"),
+                    on_progress=tracker.handle,
                 )
                 if result.document != child or result.metadata.origin != "live":
                     raise ValueError("Unexpected report version or origin")
                 result_store[run_key] = result
                 status.update(
-                    label="Получен результат повторной проверки",
+                    label=f"Получен результат повторной проверки · {tracker.elapsed_seconds:.1f} с",
                     state="error" if result.coverage.execution == "failed" else "complete",
                 )
             except ProviderError as error:
@@ -268,6 +282,7 @@ def render_clarification(report: ValidationReport, settings: ProviderSettings) -
 
     if run_key in result_store:
         result = result_store[run_key]
+        reval_md, reval_json = get_report_exports(result)
         with st.container(border=True):
             st.caption("Сравнение до и после исправления")
             st.text(recheck_summary(report, q, change, result))
@@ -280,13 +295,15 @@ def render_clarification(report: ValidationReport, settings: ProviderSettings) -
             with st.container(horizontal=True):
                 st.download_button(
                     "Повторный отчёт Markdown",
-                    render_markdown(result),
+                    reval_md,
                     "revalidated.md",
+                    "text/markdown; charset=utf-8",
                     on_click="ignore",
                 )
                 st.download_button(
                     "Повторный отчёт JSON",
-                    render_json(result),
+                    reval_json,
                     "revalidated.json",
+                    "application/json",
                     on_click="ignore",
                 )

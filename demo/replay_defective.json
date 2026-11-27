@@ -1,0 +1,530 @@
+{
+  "schema_version": "1",
+  "metadata": {
+    "run_id": "run-99d074504f99",
+    "document_version": "7fa1c24181e5e8d3cf4c06d76e31d76bb12310eaada91176013c9ef05585ed35",
+    "started_at": "2026-11-27T07:32:35.046222Z",
+    "model": "gemini-3.5-flash-lite",
+    "agent_revision": "4337c57",
+    "prompt_version": "pipeline-v1",
+    "origin": "live",
+    "duration_seconds": 26.156,
+    "request_attempts": 5,
+    "input_tokens": 5017,
+    "output_tokens": 4372
+  },
+  "document": {
+    "version": {
+      "sha256": "7fa1c24181e5e8d3cf4c06d76e31d76bb12310eaada91176013c9ef05585ed35",
+      "parent_sha256": null,
+      "parser_version": "ingest-1",
+      "name": "defective.md",
+      "format": "markdown",
+      "page_count": null,
+      "line_count": 11,
+      "blocks": [
+        {
+          "block_id": "B00001",
+          "text": "# Резервирование мест на семинар",
+          "location": {
+            "section": "Резервирование мест на семинар",
+            "page": null,
+            "line_start": 1,
+            "line_end": 1,
+            "bbox": null
+          }
+        },
+        {
+          "block_id": "B00002",
+          "text": "## Бронирование",
+          "location": {
+            "section": "Бронирование",
+            "page": null,
+            "line_start": 3,
+            "line_end": 3,
+            "bbox": null
+          }
+        },
+        {
+          "block_id": "B00003",
+          "text": "R1. Подтверждённое место освобождается через 30 минут после создания неоплаченной брони.",
+          "location": {
+            "section": "Бронирование",
+            "page": null,
+            "line_start": 5,
+            "line_end": 5,
+            "bbox": null
+          }
+        },
+        {
+          "block_id": "B00004",
+          "text": "R2. Если свободных мест нет, новая заявка получает статус WAITLIST.",
+          "location": {
+            "section": "Бронирование",
+            "page": null,
+            "line_start": 7,
+            "line_end": 7,
+            "bbox": null
+          }
+        },
+        {
+          "block_id": "B00005",
+          "text": "## Приёмка",
+          "location": {
+            "section": "Приёмка",
+            "page": null,
+            "line_start": 9,
+            "line_end": 9,
+            "bbox": null
+          }
+        },
+        {
+          "block_id": "B00006",
+          "text": "AC1. Через 30 минут после создания неоплаченной брони место остаётся за заявителем до ручной отмены.",
+          "location": {
+            "section": "Приёмка",
+            "page": null,
+            "line_start": 11,
+            "line_end": 11,
+            "bbox": null
+          }
+        }
+      ]
+    },
+    "unread_pages": [],
+    "blank_pages": [],
+    "diagnostics": []
+  },
+  "requirements": [
+    {
+      "req_id": "R001",
+      "original_id": "R1",
+      "category": "functional",
+      "summary": "Подтверждённое место должно освобождаться через 30 минут после создания неоплаченной брони",
+      "source": {
+        "version": "7fa1c24181e5e8d3cf4c06d76e31d76bb12310eaada91176013c9ef05585ed35",
+        "block_id": "B00003",
+        "start": 0,
+        "end": 88,
+        "quote": "R1. Подтверждённое место освобождается через 30 минут после создания неоплаченной брони.",
+        "grounding": "exact"
+      }
+    },
+    {
+      "req_id": "R002",
+      "original_id": "R2",
+      "category": "functional",
+      "summary": "При отсутствии свободных мест новая заявка должна получать статус WAITLIST",
+      "source": {
+        "version": "7fa1c24181e5e8d3cf4c06d76e31d76bb12310eaada91176013c9ef05585ed35",
+        "block_id": "B00004",
+        "start": 0,
+        "end": 67,
+        "quote": "R2. Если свободных мест нет, новая заявка получает статус WAITLIST.",
+        "grounding": "exact"
+      }
+    },
+    {
+      "req_id": "R003",
+      "original_id": "AC1",
+      "category": "acceptance",
+      "summary": "Через 30 минут после создания неоплаченной брони место должно оставаться за заявителем до ручной отмены",
+      "source": {
+        "version": "7fa1c24181e5e8d3cf4c06d76e31d76bb12310eaada91176013c9ef05585ed35",
+        "block_id": "B00006",
+        "start": 0,
+        "end": 100,
+        "quote": "AC1. Через 30 минут после создания неоплаченной брони место остаётся за заявителем до ручной отмены.",
+        "grounding": "exact"
+      }
+    }
+  ],
+  "evaluations": [
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.appropriate",
+      "status": "pass",
+      "rationale": "Требование описывает необходимую функциональность на правильном уровне абстракции.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.complete",
+      "status": "pass",
+      "rationale": "Требование полно: указан триггер (создание неоплаченной брони), условие времени (30 минут) и действие (освобождение места).",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.conforming",
+      "status": "not_applicable",
+      "rationale": "Шаблон или стандарт оформления не были объявлены.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.correct",
+      "status": "pass",
+      "rationale": "Требование соответствует логике предметной области.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.feasible",
+      "status": "unknown",
+      "rationale": "Недостаточно данных об архитектуре и ограничениях таймеров в фоновых процессах.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.necessary",
+      "status": "pass",
+      "rationale": "Бизнес-обоснование очевидно для системы бронирования.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.singular",
+      "status": "pass",
+      "rationale": "Требование неделимо и описывает одно атомарное действие.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.unambiguous",
+      "status": "pass",
+      "rationale": "Формулировка однозначна, содержит конкретный временной интервал.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R001",
+      "criterion": "29148.5.2.5.verifiable",
+      "status": "pass",
+      "rationale": "Требование проверяемо: можно замерить время и проверить освобождение места.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.appropriate",
+      "status": "pass",
+      "rationale": "Определяет поведение системы на нужном уровне абстракции.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.complete",
+      "status": "pass",
+      "rationale": "Содержит условие отсутствия мест и конкретный результат.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.conforming",
+      "status": "not_applicable",
+      "rationale": "Требования к оформлению не заданы.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.correct",
+      "status": "pass",
+      "rationale": "Корректно в рамках предметной области.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.feasible",
+      "status": "unknown",
+      "rationale": "Отсутствуют сведения о реализации очереди в системе.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.necessary",
+      "status": "pass",
+      "rationale": "Бизнес-целесообразность очереди ожидания очевидна.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.singular",
+      "status": "pass",
+      "rationale": "Атомарное правило обработки заявок.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.unambiguous",
+      "status": "pass",
+      "rationale": "Смысл ясен, двусмысленных терминов нет.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": "R002",
+      "criterion": "29148.5.2.5.verifiable",
+      "status": "pass",
+      "rationale": "Проверяется созданием заявки при занятых местах.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "29148.5.2.6.complete",
+      "status": "pass",
+      "rationale": "Требования охватывают базовый функционал резервирования, обработки очереди и критериев приёмки.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "29148.5.2.6.comprehensible",
+      "status": "pass",
+      "rationale": "Формулировки понятны, хотя содержат противоречия в логике времени удержания брони.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "29148.5.2.6.consistent",
+      "status": "fail",
+      "rationale": "Обнаружено прямое противоречие между требованием R1 и критерием приёмки AC1 относительно судьбы неоплаченной брони через 30 минут.",
+      "finding_ids": [
+        "F001"
+      ]
+    },
+    {
+      "requirement_id": null,
+      "criterion": "29148.5.2.6.feasible",
+      "status": "pass",
+      "rationale": "Реализация временных интервалов и статусов технически осуществима.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "29148.5.2.6.validatable",
+      "status": "pass",
+      "rationale": "Условия и статусы могут быть проверены тестированием.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.complete",
+      "status": "pass",
+      "rationale": "Все необходимые разделы спецификации присутствуют.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.consistent",
+      "status": "fail",
+      "rationale": "Найдено несоответствие между R1 и AC1 в отношении поведения неоплаченной брони по истечении 30 минут.",
+      "finding_ids": [
+        "F001"
+      ]
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.correct",
+      "status": "pass",
+      "rationale": "Спецификация внутренне корректна за исключением выявленного логического противоречия.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.modifiable",
+      "status": "pass",
+      "rationale": "Требования имеют независимые идентификаторы и легко поддаются изменению.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.ranked",
+      "status": "unknown",
+      "rationale": "В спецификации отсутствует информация о приоритетах или ранжировании требований.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.traceable",
+      "status": "pass",
+      "rationale": "Требования и критерии приёмки имеют уникальные идентификаторы R1, R2, AC1.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.unambiguous",
+      "status": "pass",
+      "rationale": "Каждое отдельное требование сформулировано однозначно, несмотря на междкуоровое противоречие.",
+      "finding_ids": []
+    },
+    {
+      "requirement_id": null,
+      "criterion": "830.4.3.verifiable",
+      "status": "pass",
+      "rationale": "Условия проверки определены корректно.",
+      "finding_ids": []
+    }
+  ],
+  "findings": [
+    {
+      "finding_id": "F001",
+      "kind": "contradiction",
+      "severity": "critical",
+      "claim": "Противоречие между требованием R1 и критерием AC1: R1 утверждает, что место освобождается через 30 минут, а AC1 утверждает, что оно остаётся за заявителем до ручной отмены. (Сценарий: По истечении 30 минут после создания неоплаченной брони: R1 требует освобождения места, в то время как AC1 требует сохранять место за заявителем.)",
+      "recommendation": "Унифицировать логику в R1 и AC1: либо место автоматически освобождается через 30 минут, либо удерживается до ручной отмены.",
+      "requirement_ids": [
+        "R001",
+        "R003"
+      ],
+      "criteria": [
+        "29148.5.2.6.consistent",
+        "830.4.3.consistent"
+      ],
+      "evidence": [
+        {
+          "version": "7fa1c24181e5e8d3cf4c06d76e31d76bb12310eaada91176013c9ef05585ed35",
+          "block_id": "B00003",
+          "start": 0,
+          "end": 88,
+          "quote": "R1. Подтверждённое место освобождается через 30 минут после создания неоплаченной брони.",
+          "grounding": "exact"
+        },
+        {
+          "version": "7fa1c24181e5e8d3cf4c06d76e31d76bb12310eaada91176013c9ef05585ed35",
+          "block_id": "B00006",
+          "start": 0,
+          "end": 100,
+          "quote": "AC1. Через 30 минут после создания неоплаченной брони место остаётся за заявителем до ручной отмены.",
+          "grounding": "exact"
+        }
+      ],
+      "gap": null,
+      "semantic_status": "supported",
+      "verification_reason": "Требование R1 и критерий AC1 прямо противоречат друг другу для одного и того же сценария: R1 требует освобождения места через 30 минут, а AC1 требует сохранять его за заявителем до ручной отмены."
+    }
+  ],
+  "coverage": {
+    "execution": "partial",
+    "extraction_blocks": {
+      "planned": [
+        "B00001",
+        "B00002",
+        "B00003",
+        "B00004",
+        "B00005",
+        "B00006"
+      ],
+      "completed": [
+        "B00001",
+        "B00002",
+        "B00003",
+        "B00004",
+        "B00005",
+        "B00006"
+      ]
+    },
+    "context_blocks": {
+      "B00001": "Заголовок раздела документов, не содержит нормативных требований",
+      "B00002": "Заголовок подраздела документа, не содержит нормативных требований",
+      "B00005": "Заголовок подраздела приёмки, не содержит нормативных требований"
+    },
+    "individual_requirements": {
+      "planned": [
+        "R001",
+        "R002",
+        "R003"
+      ],
+      "completed": [
+        "R001",
+        "R002"
+      ]
+    },
+    "audit_batches": {
+      "planned": [
+        "extract-1",
+        "indiv-1"
+      ],
+      "completed": [
+        "extract-1"
+      ]
+    },
+    "cross_section_groups": {
+      "planned": [
+        "whole-spec"
+      ],
+      "completed": [
+        "whole-spec"
+      ]
+    },
+    "incomplete_reasons": [
+      "Находка K1 (R003): противоречие требует две независимые подтверждённые цитаты.",
+      "Индивидуальный аудит завершён для 2 из 3 требований.",
+      "Завершено пакетов индивидуального аудита: 0 из 1."
+    ],
+    "uncertainties": []
+  },
+  "questions": [
+    {
+      "question_id": "Q001",
+      "finding_ids": [
+        "F001"
+      ],
+      "requirement_ids": [
+        "R001",
+        "R003"
+      ],
+      "evidence": [
+        {
+          "version": "7fa1c24181e5e8d3cf4c06d76e31d76bb12310eaada91176013c9ef05585ed35",
+          "block_id": "B00003",
+          "start": 0,
+          "end": 88,
+          "quote": "R1. Подтверждённое место освобождается через 30 минут после создания неоплаченной брони.",
+          "grounding": "exact"
+        },
+        {
+          "version": "7fa1c24181e5e8d3cf4c06d76e31d76bb12310eaada91176013c9ef05585ed35",
+          "block_id": "B00006",
+          "start": 0,
+          "end": 100,
+          "quote": "AC1. Через 30 минут после создания неоплаченной брони место остаётся за заявителем до ручной отмены.",
+          "grounding": "exact"
+        }
+      ],
+      "uncertainty": "Не определено поведение системы по истечении 30 минут для неоплаченной брони: требуется ли автоматическое освобождение места или его удержание до ручной отмены администратором или пользователем.",
+      "stakeholder": "product_owner",
+      "priority": "P0",
+      "business_impact": "Конфликт в бизнес-логике приведет к дефектам в автоматических тестах и недовольству пользователей из-за непредсказуемого освобождения брони.",
+      "question": "Какое поведение системы должно быть реализовано по истечении 30 минут для неоплаченной брони?",
+      "options": [
+        {
+          "option_id": "opt_1",
+          "label": "Автоматическое освобождение",
+          "consequence": "Обновить требование R1 и критерий AC1, зафиксировав автоматическое снятие брони по тайм-ауту. Снижает нагрузку на ручную отмену, но требует фонового воркера."
+        },
+        {
+          "option_id": "opt_2",
+          "label": "Удержание до ручной отмены",
+          "consequence": "Обновить требование R1 в соответствии с AC1, зафиксировав удержание брони до ручного действия. Упрощает бэкенд-логику, но может привести к дефициту свободных мест."
+        }
+      ],
+      "allow_custom": true
+    }
+  ],
+  "answers": [],
+  "proposed_changes": [],
+  "verdict": {
+    "readiness": "no_go",
+    "rationale": "Подтверждён критический дефект. Начало разработки и тестирования следует отложить. Анализ выполнен частично. Пробелы покрытия: Находка K1 (R003): противоречие требует две независимые подтверждённые цитаты. · Индивидуальный аудит завершён для 2 из 3 требований. · Завершено пакетов индивидуального аудита: 0 из 1.",
+    "next_actions": [
+      "F001 — Унифицировать логику в R1 и AC1: либо место автоматически освобождается через 30 минут, либо удерживается до ручной отмены.",
+      "Восстановить пропущенный объём и повторить анализ."
+    ]
+  },
+  "statistics": {
+    "requirements": 3,
+    "violations": 1,
+    "critical": 1,
+    "major": 0,
+    "minor": 0,
+    "open_hypotheses": 0,
+    "questions": 1
+  }
+}

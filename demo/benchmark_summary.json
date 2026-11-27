@@ -1,0 +1,186 @@
+{
+  "model": "gemini-3.5-flash-lite",
+  "cases": [
+    {
+      "case": "defective",
+      "cli_exit_code": 2,
+      "evaluation": {
+        "case": "defective",
+        "format": "markdown",
+        "run": {
+          "run_id": "run-99d074504f99",
+          "document_version": "7fa1c24181e5e8d3cf4c06d76e31d76bb12310eaada91176013c9ef05585ed35",
+          "started_at": "2026-11-27T07:32:35.046222Z",
+          "model": "gemini-3.5-flash-lite",
+          "agent_revision": "4337c57",
+          "prompt_version": "pipeline-v1",
+          "origin": "live",
+          "duration_seconds": 26.156,
+          "request_attempts": 5,
+          "input_tokens": 5017,
+          "output_tokens": 4372
+        },
+        "execution": "partial",
+        "readiness": "no_go",
+        "input_documents": 1,
+        "grounding": {
+          "numerator": 2,
+          "denominator": 2,
+          "value": 1.0
+        },
+        "coverage": {
+          "extraction_blocks": {
+            "numerator": 6,
+            "denominator": 6,
+            "value": 1.0
+          },
+          "individual_requirements": {
+            "numerator": 2,
+            "denominator": 3,
+            "value": 0.6666666666666666
+          },
+          "audit_batches": {
+            "numerator": 1,
+            "denominator": 2,
+            "value": 0.5
+          },
+          "cross_section_groups": {
+            "numerator": 1,
+            "denominator": 1,
+            "value": 1.0
+          }
+        },
+        "incomplete_reasons": [
+          "Находка K1 (R003): противоречие требует две независимые подтверждённые цитаты.",
+          "Индивидуальный аудит завершён для 2 из 3 требований.",
+          "Завершено пакетов индивидуального аудита: 0 из 1."
+        ],
+        "requirement_recall": null,
+        "finding_precision": null,
+        "finding_recall": null,
+        "critical_recall": null,
+        "false_positive_rate": null,
+        "question_usefulness": null,
+        "reviewers": []
+      }
+    },
+    {
+      "case": "clean",
+      "cli_exit_code": 0,
+      "evaluation": {
+        "case": "clean",
+        "format": "markdown",
+        "run": {
+          "run_id": "run-c409da6fd9df",
+          "document_version": "2c319e36fa5dcd529cfe60d21e890e98700a2006cbb4573e9200931462eb26bf",
+          "started_at": "2026-11-27T07:33:02.275403Z",
+          "model": "gemini-3.5-flash-lite",
+          "agent_revision": "4337c57",
+          "prompt_version": "pipeline-v1",
+          "origin": "live",
+          "duration_seconds": 9.0,
+          "request_attempts": 3,
+          "input_tokens": 2984,
+          "output_tokens": 2506
+        },
+        "execution": "complete",
+        "readiness": "go",
+        "input_documents": 1,
+        "grounding": {
+          "numerator": 0,
+          "denominator": 0,
+          "value": null
+        },
+        "coverage": {
+          "extraction_blocks": {
+            "numerator": 3,
+            "denominator": 3,
+            "value": 1.0
+          },
+          "individual_requirements": {
+            "numerator": 2,
+            "denominator": 2,
+            "value": 1.0
+          },
+          "audit_batches": {
+            "numerator": 2,
+            "denominator": 2,
+            "value": 1.0
+          },
+          "cross_section_groups": {
+            "numerator": 1,
+            "denominator": 1,
+            "value": 1.0
+          }
+        },
+        "incomplete_reasons": [],
+        "requirement_recall": null,
+        "finding_precision": null,
+        "finding_recall": null,
+        "critical_recall": null,
+        "false_positive_rate": null,
+        "question_usefulness": null,
+        "reviewers": []
+      }
+    },
+    {
+      "case": "untrusted",
+      "cli_exit_code": 0,
+      "evaluation": {
+        "case": "untrusted",
+        "format": "markdown",
+        "run": {
+          "run_id": "run-7592e5a01cd5",
+          "document_version": "f9a2eeeaeadaeb8cabfa535dbdffdcaf5be65d586501552c02bad1fc6aaaf48c",
+          "started_at": "2026-11-27T07:33:12.244394Z",
+          "model": "gemini-3.5-flash-lite",
+          "agent_revision": "4337c57",
+          "prompt_version": "pipeline-v1",
+          "origin": "live",
+          "duration_seconds": 12.531,
+          "request_attempts": 5,
+          "input_tokens": 4125,
+          "output_tokens": 2770
+        },
+        "execution": "complete",
+        "readiness": "undetermined",
+        "input_documents": 1,
+        "grounding": {
+          "numerator": 1,
+          "denominator": 1,
+          "value": 1.0
+        },
+        "coverage": {
+          "extraction_blocks": {
+            "numerator": 4,
+            "denominator": 4,
+            "value": 1.0
+          },
+          "individual_requirements": {
+            "numerator": 1,
+            "denominator": 1,
+            "value": 1.0
+          },
+          "audit_batches": {
+            "numerator": 2,
+            "denominator": 2,
+            "value": 1.0
+          },
+          "cross_section_groups": {
+            "numerator": 1,
+            "denominator": 1,
+            "value": 1.0
+          }
+        },
+        "incomplete_reasons": [],
+        "requirement_recall": null,
+        "finding_precision": null,
+        "finding_recall": null,
+        "critical_recall": null,
+        "false_positive_rate": null,
+        "question_usefulness": null,
+        "reviewers": []
+      }
+    }
+  ]
+}
